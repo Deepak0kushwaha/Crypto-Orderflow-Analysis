@@ -16,6 +16,12 @@ const TIMEFRAME_LOOKUP=Object.fromEntries(TIMEFRAMES.map((t)=>[t.key,t]));
 const DEFAULT_SYMBOL='BTCUSD';
 const DEFAULT_TIMEFRAME='1m';
 const STREAM_TO_SYMBOL=Object.fromEntries(Object.entries(MARKETS).map(([s,c])=>[c.stream,s]));
+const BINANCE_SOURCES=[
+  {name:'global',restBase:'https://api.binance.com',wsBase:'wss://stream.binance.com'},
+  {name:'us',restBase:'https://api.binance.us',wsBase:'wss://stream.binance.us'},
+];
+const BINANCE_SOURCE_PREF=(process.env.BINANCE_SOURCE||'auto').toLowerCase();
+let activeBinanceSourceIndex=BINANCE_SOURCE_PREF==='us'?1:0;
 
 const MAX_ALERTS=180;
 const MAX_MINUTE_SERIES=120;
@@ -29,6 +35,17 @@ const ORDER_BOOK_DETAIL_LEVELS=20;
 const VOLUME_PROFILE_TARGET_BINS=42;
 const VALUE_AREA_TARGET_PCT=0.7;
 const SNAPSHOT_INTERVAL_MS=300;
+
+function getActiveBinanceSource(){
+  return BINANCE_SOURCES[activeBinanceSourceIndex]||BINANCE_SOURCES[0];
+}
+function rotateBinanceSource(reason){
+  if(BINANCE_SOURCES.length<2){return;}
+  const prev=getActiveBinanceSource();
+  activeBinanceSourceIndex=(activeBinanceSourceIndex+1)%BINANCE_SOURCES.length;
+  const next=getActiveBinanceSource();
+  console.log(`[binance] switching source ${prev.name} -> ${next.name}${reason?` (${reason})`:''}`);
+}
 
 function frameState(ms){return{ms,bars:new Map(),barKeys:[]};}
 function symbolState(symbol,cfg){
@@ -184,6 +201,7 @@ function handleDepth(data,s){
   if(!bids.length||!asks.length){return;}
   const topBid=bids[0].price;const topAsk=asks[0].price;
   s.lastTopBid=topBid;s.lastTopAsk=topAsk;s.spreadPct=topBid>0?(topAsk-topBid)/topBid:0;
+  if(s.lastPrice===null&&Number.isFinite(topBid)&&Number.isFinite(topAsk)){s.lastPrice=(topBid+topAsk)/2;}
   const topBidQty5=bids.slice(0,5).reduce((sum,l)=>sum+l.qty,0);
   const topAskQty5=asks.slice(0,5).reduce((sum,l)=>sum+l.qty,0);
 
@@ -721,13 +739,15 @@ setInterval(()=>{
 },SNAPSHOT_INTERVAL_MS);
 
 function buildBinanceStreamUrl(){
+  const src=getActiveBinanceSource();
   const streams=[];
   Object.values(MARKETS).forEach((cfg)=>{streams.push(`${cfg.stream}@aggTrade`);streams.push(`${cfg.stream}@depth20@100ms`);});
-  return `wss://stream.binance.com:9443/stream?streams=${streams.join('/')}`;
+  return `${src.wsBase}/stream?streams=${streams.join('/')}`;
 }
 
 let binanceSocket=null;
 let reconnectDelayMs=1500;
+let binanceDataWatchdog=null;
 
 function insertBar(frame, barTs, bar) {
   frame.bars.set(barTs, bar);
@@ -739,12 +759,34 @@ function insertBar(frame, barTs, bar) {
 }
 
 async function fetchKlines(binanceSymbol, interval, limit = 260) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${binanceSymbol}&interval=${interval}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`klines ${binanceSymbol} ${interval} http ${res.status}`);
+  const sourceOrder=[activeBinanceSourceIndex,...BINANCE_SOURCES.map((_x,i)=>i).filter((i)=>i!==activeBinanceSourceIndex)];
+  let lastErr=new Error(`klines ${binanceSymbol} ${interval} failed`);
+
+  for(const idx of sourceOrder){
+    const src=BINANCE_SOURCES[idx];
+    const url = `${src.restBase}/api/v3/klines?symbol=${binanceSymbol}&interval=${interval}&limit=${limit}`;
+    try{
+      const res = await fetch(url);
+      if (!res.ok) {
+        throw new Error(`http ${res.status}`);
+      }
+      const rows=await res.json();
+      if(!Array.isArray(rows)||rows.length===0){
+        throw new Error('empty response');
+      }
+      if(idx!==activeBinanceSourceIndex){
+        const prev=getActiveBinanceSource();
+        activeBinanceSourceIndex=idx;
+        const next=getActiveBinanceSource();
+        console.log(`[binance] REST source switched ${prev.name} -> ${next.name}`);
+      }
+      return rows;
+    }catch(err){
+      lastErr=new Error(`source ${src.name}: ${err.message}`);
+    }
   }
-  return res.json();
+
+  throw lastErr;
 }
 
 function seedFrameFromKlines(s, timeframeKey, rows) {
@@ -857,13 +899,23 @@ async function seedHistoricalData() {
 function connectBinance(){
   const streamUrl=buildBinanceStreamUrl();
   binanceSocket=new WebSocket(streamUrl);
+  let hasReceivedData=false;
 
   binanceSocket.on('open',()=>{
     reconnectDelayMs=1500;
     console.log(`[binance] connected to ${streamUrl}`);
+    if(binanceDataWatchdog){clearTimeout(binanceDataWatchdog);}
+    binanceDataWatchdog=setTimeout(()=>{
+      if(!hasReceivedData){
+        rotateBinanceSource('no stream data after connect');
+        try{binanceSocket.close();}catch{}
+      }
+    },15000);
   });
 
   binanceSocket.on('message',(raw)=>{
+    hasReceivedData=true;
+    if(binanceDataWatchdog){clearTimeout(binanceDataWatchdog);binanceDataWatchdog=null;}
     let parsed;
     try{parsed=JSON.parse(raw.toString());}catch{return;}
     const stream=parsed.stream;const data=parsed.data;
@@ -879,12 +931,14 @@ function connectBinance(){
   });
 
   binanceSocket.on('close',()=>{
+    if(binanceDataWatchdog){clearTimeout(binanceDataWatchdog);binanceDataWatchdog=null;}
     console.log('[binance] disconnected, reconnecting...');
     setTimeout(connectBinance,reconnectDelayMs);
     reconnectDelayMs=Math.min(reconnectDelayMs*1.7,15000);
   });
 
   binanceSocket.on('error',(err)=>{
+    if(binanceDataWatchdog){clearTimeout(binanceDataWatchdog);binanceDataWatchdog=null;}
     console.error('[binance] error',err.message);
     try{binanceSocket.close();}catch{}
   });
