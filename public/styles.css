@@ -358,6 +358,76 @@ body {
   overflow-y: auto;
 }
 
+.final-signal-card {
+  border: 1px solid var(--line);
+  border-left-width: 5px;
+  border-radius: 12px;
+  padding: 10px;
+  margin-bottom: 9px;
+  background: #fcfeff;
+}
+
+.final-signal-card.buy {
+  border-left-color: rgba(21, 128, 61, 0.92);
+  background: linear-gradient(130deg, rgba(21, 128, 61, 0.08), rgba(255, 255, 255, 0.98));
+}
+
+.final-signal-card.sell {
+  border-left-color: rgba(220, 38, 38, 0.92);
+  background: linear-gradient(130deg, rgba(220, 38, 38, 0.09), rgba(255, 255, 255, 0.98));
+}
+
+.final-signal-card.wait {
+  border-left-color: rgba(71, 85, 105, 0.7);
+  background: linear-gradient(130deg, rgba(100, 116, 139, 0.07), rgba(255, 255, 255, 0.98));
+}
+
+.final-signal-head {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: center;
+  gap: 10px;
+}
+
+.final-signal-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.final-signal-side {
+  font-size: 0.98rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.final-signal-confidence {
+  justify-self: end;
+  font-size: 0.82rem;
+  font-family: 'IBM Plex Mono', monospace;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #ffffff;
+}
+
+.final-signal-card.buy .final-signal-side,
+.final-signal-card.buy .final-signal-confidence { color: var(--bull); }
+
+.final-signal-card.sell .final-signal-side,
+.final-signal-card.sell .final-signal-confidence { color: var(--bear); }
+
+.final-signal-card.wait .final-signal-side,
+.final-signal-card.wait .final-signal-confidence { color: #334155; }
+
+.final-signal-meta {
+  margin: 7px 0 0;
+  color: #334155;
+  font-size: 0.79rem;
+}
+
 .alert {
   border: 1px solid var(--line);
   border-left-width: 4px;

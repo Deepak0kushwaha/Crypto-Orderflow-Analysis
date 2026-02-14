@@ -38,6 +38,12 @@ const SNAPSHOT_INTERVAL_MS=300;
 const REST_FALLBACK_INTERVAL_MS=1200;
 const REST_STALE_THRESHOLD_MS=2400;
 const REST_RECENT_TRADES_LIMIT=30;
+const FLOW_WINDOW_SHORT_MS=10000;
+const FLOW_WINDOW_LONG_MS=30000;
+const FLOW_WINDOW_BASELINE_MS=60000;
+const STACKED_IMBALANCE_RATIO=2.2;
+const STACKED_IMBALANCE_LEVELS=3;
+const SPOOFING_QTR_THRESHOLD=6.5;
 
 function getActiveBinanceSource(){
   return BINANCE_SOURCES[activeBinanceSourceIndex]||BINANCE_SOURCES[0];
@@ -57,7 +63,11 @@ function symbolState(symbol,cfg){
   return{
     symbol,cfg,lastPrice:null,cvd:0,spreadPct:0,lastTopBid:null,lastTopAsk:null,topBidQty5:0,topAskQty5:0,
     currentMinute:null,currentMinuteVolume:0,minuteSeries:[],tradeWindow:[],priceWindow:[],alerts:[],frames,
-    lastAlertAt:{divergence:0,absorption:0,sweep:0},deltaEma:0,pendingDrops:{ask:null,bid:null},replenishments:[],sweepCandidates:[],
+    tfiEvents:[],ofiEvents:[],quoteEvents:[],
+    bestQuote:{bidPrice:null,bidQty:0,askPrice:null,askQty:0},
+    flowMetrics:{ofi10s:0,tfi10s:0,quoteTradeRatio30s:0,quotes30s:0,trades30s:0},
+    lastAlertAt:{divergence:0,absorption:0,sweep:0,dislocation:0,stackedImbalance:0},
+    deltaEma:0,pendingDrops:{ask:null,bid:null},replenishments:[],sweepCandidates:[],
     orderBook:{ts:0,bids:[],asks:[],bidTotal:0,askTotal:0,imbalance:0,speed:0},lastDepthUpdateTs:0,depthRateEma:0,
     lastTradeUpdateTs:0,lastAnyMarketDataTs:0,lastRestTradeIds:Object.fromEntries(BINANCE_SOURCES.map((src)=>[src.name,0])),
   };
@@ -65,6 +75,8 @@ function symbolState(symbol,cfg){
 const state=Object.fromEntries(Object.entries(MARKETS).map(([s,c])=>[s,symbolState(s,c)]));
 
 const mean=(arr)=>!arr||arr.length===0?0:arr.reduce((a,b)=>a+b,0)/arr.length;
+const sum=(arr)=>!arr||arr.length===0?0:arr.reduce((a,b)=>a+b,0);
+const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
 const pruneByAge=(arr,now,age)=>{while(arr.length&&now-arr[0].ts>age){arr.shift();}};
 const pruneByLength=(arr,n)=>{if(arr.length>n){arr.splice(0,arr.length-n);}};
 const fmt=(v,d=2)=>Number.isFinite(v)?v.toFixed(d):'0';
@@ -176,6 +188,98 @@ function detectSweep(s,now){
   }
 }
 
+function sumWindow(events,now,windowMs){
+  if(!Array.isArray(events)||events.length===0){return 0;}
+  return sum(events.filter((e)=>now-e.ts<=windowMs).map((e)=>e.value||0));
+}
+
+function countWindow(events,now,windowMs){
+  if(!Array.isArray(events)||events.length===0){return 0;}
+  return events.reduce((count,e)=>count+(now-e.ts<=windowMs?1:0),0);
+}
+
+function computeFlowMetrics(s,now){
+  pruneByAge(s.tfiEvents,now,FLOW_WINDOW_BASELINE_MS+FLOW_WINDOW_LONG_MS);
+  pruneByAge(s.ofiEvents,now,FLOW_WINDOW_BASELINE_MS+FLOW_WINDOW_LONG_MS);
+  pruneByAge(s.quoteEvents,now,FLOW_WINDOW_BASELINE_MS+FLOW_WINDOW_LONG_MS);
+
+  const ofi10s=sumWindow(s.ofiEvents,now,FLOW_WINDOW_SHORT_MS);
+  const tfi10s=sumWindow(s.tfiEvents,now,FLOW_WINDOW_SHORT_MS);
+  const quotes30s=countWindow(s.quoteEvents,now,FLOW_WINDOW_LONG_MS);
+  const trades30s=countWindow(s.tfiEvents,now,FLOW_WINDOW_LONG_MS);
+  const quoteTradeRatio30s=quotes30s/Math.max(1,trades30s);
+  const ofiAbsBaseline=mean(s.ofiEvents.filter((e)=>now-e.ts<=FLOW_WINDOW_BASELINE_MS).map((e)=>Math.abs(e.value||0)));
+  const tfiAbsBaseline=mean(s.tfiEvents.filter((e)=>now-e.ts<=FLOW_WINDOW_BASELINE_MS).map((e)=>Math.abs(e.value||0)));
+
+  s.flowMetrics={ofi10s,tfi10s,quoteTradeRatio30s,quotes30s,trades30s};
+  return{ofi10s,tfi10s,quoteTradeRatio30s,quotes30s,trades30s,ofiAbsBaseline,tfiAbsBaseline};
+}
+
+function detectFlowDislocation(s,now){
+  if(now-s.lastAlertAt.dislocation<35000){return;}
+  const flow=computeFlowMetrics(s,now);
+  if(!Number.isFinite(s.lastPrice)||s.priceWindow.length<4){return;}
+
+  const flowThreshold=Math.max(s.cfg.absorptionMinDelta*3,flow.ofiAbsBaseline*4.8,18);
+  if(Math.abs(flow.ofi10s)<flowThreshold){return;}
+
+  const tfiWeak=Math.abs(flow.tfi10s)<=Math.max(4,Math.abs(flow.ofi10s)*0.32);
+  if(!tfiWeak||flow.quoteTradeRatio30s<SPOOFING_QTR_THRESHOLD){return;}
+
+  const recentPrices=s.priceWindow.filter((p)=>now-p.ts<=FLOW_WINDOW_SHORT_MS).map((p)=>p.price);
+  if(recentPrices.length<2){return;}
+  const p0=recentPrices[0];
+  const p1=recentPrices[recentPrices.length-1];
+  const movePct=p0>0?Math.abs((p1-p0)/p0):1;
+  if(movePct>s.cfg.stallPct*0.95){return;}
+
+  s.lastAlertAt.dislocation=now;
+  const bias=flow.ofi10s>0?'bullish':'bearish';
+  addAlert(s,{
+    id:`${s.symbol}-dislocation-${now}`,
+    ts:now,
+    type:'Flow Dislocation',
+    severity:'medium',
+    bias,
+    price:s.lastPrice,
+    message:`${s.symbol} OFI/TFI dislocation: OFI ${fmt(flow.ofi10s,0)}, TFI ${fmt(flow.tfi10s,0)}, Q/T ${fmt(flow.quoteTradeRatio30s,2)}. Likely ephemeral liquidity pressure.`,
+  });
+}
+
+function detectStackedImbalance(s,now){
+  if(now-s.lastAlertAt.stackedImbalance<22000){return;}
+  const bids=s.orderBook?.bids||[];
+  const asks=s.orderBook?.asks||[];
+  const depth=Math.min(bids.length,asks.length,8);
+  if(depth<STACKED_IMBALANCE_LEVELS){return;}
+
+  let buyStack=0;
+  let sellStack=0;
+  for(let i=0;i<depth;i+=1){
+    if(bids[i].qty>=asks[i].qty*STACKED_IMBALANCE_RATIO){buyStack+=1;}else{break;}
+  }
+  for(let i=0;i<depth;i+=1){
+    if(asks[i].qty>=bids[i].qty*STACKED_IMBALANCE_RATIO){sellStack+=1;}else{break;}
+  }
+
+  if(buyStack<STACKED_IMBALANCE_LEVELS&&sellStack<STACKED_IMBALANCE_LEVELS){return;}
+  s.lastAlertAt.stackedImbalance=now;
+
+  const bullish=buyStack>=sellStack;
+  const levels=bullish?buyStack:sellStack;
+  addAlert(s,{
+    id:`${s.symbol}-stacked-${now}`,
+    ts:now,
+    type:'Stacked Imbalance',
+    severity:levels>=4?'high':'medium',
+    bias:bullish?'bullish':'bearish',
+    price:s.lastPrice,
+    message:bullish
+      ?`${s.symbol} stacked bid imbalance (${levels} levels) indicates aggressive buyers leaning on the book.`
+      :`${s.symbol} stacked ask imbalance (${levels} levels) indicates aggressive sellers leaning on the book.`,
+  });
+}
+
 function handleTrade(data,s){
   const ts=Number(data.T||data.E||Date.now());
   const price=Number(data.p);const qty=Number(data.q);const isBuyerMaker=Boolean(data.m);
@@ -186,11 +290,12 @@ function handleTrade(data,s){
   const deltaQty=isBuyerMaker?-qty:qty;
   s.cvd+=deltaQty;
   s.deltaEma=s.deltaEma*0.98+Math.abs(deltaQty)*0.02;
+  s.tfiEvents.push({ts,value:deltaQty});
   s.tradeWindow.push({ts,price,deltaQty,qty});s.priceWindow.push({ts,price});
   pruneByAge(s.tradeWindow,ts,20000);pruneByAge(s.priceWindow,ts,70000);
   updateMinuteSeries(s,ts,qty);
   updateBarsAndFootprint(s,ts,price,qty,isBuyerMaker);
-  detectAbsorption(s,ts);detectSweep(s,ts);
+  detectAbsorption(s,ts);detectSweep(s,ts);detectFlowDislocation(s,ts);
 }
 
 function handleDepth(data,s){
@@ -207,6 +312,19 @@ function handleDepth(data,s){
   if(!bids.length||!asks.length){return;}
   s.lastAnyMarketDataTs=now;
   const topBid=bids[0].price;const topAsk=asks[0].price;
+  const topBidQty1=bids[0].qty;const topAskQty1=asks[0].qty;
+  s.quoteEvents.push({ts:now,value:1});
+
+  if(Number.isFinite(s.bestQuote.bidPrice)&&Number.isFinite(s.bestQuote.askPrice)){
+    const bidFlow=(topBid>=s.bestQuote.bidPrice?topBidQty1:0)-(topBid<=s.bestQuote.bidPrice?s.bestQuote.bidQty:0);
+    const askFlow=(topAsk<=s.bestQuote.askPrice?topAskQty1:0)-(topAsk>=s.bestQuote.askPrice?s.bestQuote.askQty:0);
+    const ofiEvent=bidFlow-askFlow;
+    if(Number.isFinite(ofiEvent)){
+      s.ofiEvents.push({ts:now,value:ofiEvent});
+    }
+  }
+  s.bestQuote={bidPrice:topBid,bidQty:topBidQty1,askPrice:topAsk,askQty:topAskQty1};
+
   s.lastTopBid=topBid;s.lastTopAsk=topAsk;s.spreadPct=topBid>0?(topAsk-topBid)/topBid:0;
   if(s.lastPrice===null&&Number.isFinite(topBid)&&Number.isFinite(topAsk)){s.lastPrice=(topBid+topAsk)/2;}
   const topBidQty5=bids.slice(0,5).reduce((sum,l)=>sum+l.qty,0);
@@ -262,6 +380,8 @@ function handleDepth(data,s){
 
   s.topBidQty5=topBidQty5;s.topAskQty5=topAskQty5;
   pruneByAge(s.replenishments,now,12000);pruneByAge(s.sweepCandidates,now,8000);
+  detectStackedImbalance(s,now);
+  detectFlowDislocation(s,now);
 }
 
 function decorateOrderBookSide(levels){
@@ -281,6 +401,14 @@ function buildOrderBookDetail(s){
   const raw=s.orderBook||{};
   const bids=decorateOrderBookSide(Array.isArray(raw.bids)?raw.bids.slice(0,ORDER_BOOK_DETAIL_LEVELS):[]);
   const asks=decorateOrderBookSide(Array.isArray(raw.asks)?raw.asks.slice(0,ORDER_BOOK_DETAIL_LEVELS):[]);
+  const dispersion=(rows)=>{
+    const vals=rows.map((r)=>r.qty).filter((v)=>Number.isFinite(v)&&v>0);
+    if(vals.length===0){return 0;}
+    const m=mean(vals);
+    if(m<=0){return 0;}
+    const variance=mean(vals.map((v)=>(v-m)**2));
+    return Math.sqrt(variance)/m;
+  };
 
   const bestBid=bids[0]?.price??s.lastTopBid??null;
   const bestAsk=asks[0]?.price??s.lastTopAsk??null;
@@ -296,6 +424,7 @@ function buildOrderBookDetail(s){
     bestBid,bestAsk,spread,spreadPct,
     midPrice:Number.isFinite(bestBid)&&Number.isFinite(bestAsk)?(bestBid+bestAsk)/2:null,
     bidTotal,askTotal,imbalance,
+    depthDispersion:(dispersion(bids)+dispersion(asks))/2,
     speed:Number.isFinite(raw.speed)?raw.speed:0,
     maxQty,
     bids,asks,
@@ -328,54 +457,121 @@ function selectDistinctZones(candidates,maxCount,minDistance){
 }
 
 function buildZoneModel(candles,cfg,referencePrice){
-  if(!Number.isFinite(referencePrice)||candles.length<24){return{support:[],resistance:[],binSize:0};}
-  const sample=candles.slice(-140);
-  const avgRange=mean(sample.map((c)=>Math.max(c.high-c.low,cfg.tickSize)))||cfg.tickSize*6;
-  const binSize=Math.max(cfg.tickSize*3,avgRange*0.35,referencePrice*0.0007);
-  const bins=new Map();
+  if(!Number.isFinite(referencePrice)||candles.length<30){return{support:[],resistance:[],binSize:0};}
+  const sample=candles.slice(-180);
+  const ranges=sample.map((c)=>Math.max(c.high-c.low,cfg.tickSize));
+  const atr=mean(ranges)||cfg.tickSize*6;
+  const tolerance=Math.max(cfg.tickSize*2,atr*0.18,referencePrice*0.00035);
+  const zoneHalf=Math.max(cfg.tickSize*2,atr*0.27);
+  const binSize=Math.max(cfg.tickSize,tolerance);
 
+  const candidates=[];
+  const pushCandidate=(price,kind,source,weight=1)=>{
+    if(!Number.isFinite(price)){return;}
+    candidates.push({center:roundToStep(price,binSize),kind,source,weight});
+  };
+
+  for(let i=2;i<sample.length-2;i+=1){
+    const c=sample[i];
+    const highs=[sample[i-2].high,sample[i-1].high,sample[i+1].high,sample[i+2].high];
+    const lows=[sample[i-2].low,sample[i-1].low,sample[i+1].low,sample[i+2].low];
+    if(c.high>=Math.max(...highs)){pushCandidate(c.high,'resistance','pivot',1.5);}
+    if(c.low<=Math.min(...lows)){pushCandidate(c.low,'support','pivot',1.5);}
+  }
+
+  const profileBins=new Map();
   for(const c of sample){
     const center=roundToStep((c.high+c.low+c.close)/3,binSize);
-    const k=center.toFixed(8);
-    if(!bins.has(k)){bins.set(k,{center,vol:0,touches:0,supportRejections:0,resistanceRejections:0});}
-    const e=bins.get(k);
-    e.vol+=c.totalVol;
-    if(c.low<=center&&c.high>=center){e.touches+=1;}
-    if(c.low<center&&c.close>center){e.supportRejections+=1;}
-    if(c.high>center&&c.close<center){e.resistanceRejections+=1;}
+    const key=center.toFixed(8);
+    if(!profileBins.has(key)){profileBins.set(key,{center,vol:0});}
+    profileBins.get(key).vol+=Math.max(0,c.totalVol||0);
+  }
+  const topProfile=[...profileBins.values()].sort((a,b)=>b.vol-a.vol).slice(0,16);
+  for(const row of topProfile){
+    pushCandidate(row.center,row.center<=referencePrice?'support':'resistance','hvn',1);
   }
 
-  const rows=[...bins.values()];
-  const maxVol=Math.max(...rows.map((r)=>r.vol),1);
-  const rawSupport=[];const rawResistance=[];
+  const aggregated=new Map();
+  const maxVol=Math.max(1,...sample.map((c)=>c.totalVol||0));
 
-  for(const r of rows){
-    const type=r.center<=referencePrice?'support':'resistance';
-    const dist=Math.abs(referencePrice-r.center);
-    const distScore=1-Math.min(1,dist/Math.max(avgRange*18,cfg.tickSize*40));
-    const rej=type==='support'?r.supportRejections:r.resistanceRejections;
-    const score=(r.vol/maxVol)*58+r.touches*2.4+rej*8.5+distScore*10;
-    const half=Math.max(binSize*0.46,cfg.tickSize*2);
+  for(const c of candidates){
+    const key=`${c.kind}-${roundToStep(c.center,binSize).toFixed(8)}`;
+    if(!aggregated.has(key)){
+      aggregated.set(key,{
+        kind:c.kind,center:c.center,
+        sourceWeight:0,touches:0,rejections:0,breaks:0,volume:0,lastTouchTs:0,
+      });
+    }
+    const row=aggregated.get(key);
+    row.sourceWeight+=c.weight;
+  }
+
+  for(const z of aggregated.values()){
+    for(const c of sample){
+      const inZone=c.low<=z.center+tolerance&&c.high>=z.center-tolerance;
+      if(inZone){
+        z.touches+=1;
+        z.volume+=Math.max(0,c.totalVol||0);
+        z.lastTouchTs=Math.max(z.lastTouchTs,c.ts||0);
+      }
+
+      if(z.kind==='support'){
+        if(c.low<=z.center+tolerance&&c.close>=z.center&&c.close>=c.open){z.rejections+=1;}
+        if(c.close<z.center-tolerance*0.9){z.breaks+=1;}
+      }else{
+        if(c.high>=z.center-tolerance&&c.close<=z.center&&c.close<=c.open){z.rejections+=1;}
+        if(c.close>z.center+tolerance*0.9){z.breaks+=1;}
+      }
+    }
+  }
+
+  const maxZoneVol=Math.max(1,...[...aggregated.values()].map((z)=>z.volume));
+  const latestTs=sample[sample.length-1]?.ts||Date.now();
+  const maxDistance=Math.max(atr*34,cfg.tickSize*90);
+  const supportRaw=[];
+  const resistanceRaw=[];
+
+  for(const z of aggregated.values()){
+    const dist=Math.abs(referencePrice-z.center);
+    if(dist>maxDistance){continue;}
+    if(z.touches<2&&z.rejections<1){continue;}
+
+    const distScore=1-Math.min(1,dist/maxDistance);
+    const recencyScore=z.lastTouchTs>0?Math.max(0,1-Math.min(1,(latestTs-z.lastTouchTs)/(TIMEFRAME_LOOKUP['1h'].ms*8))):0;
+    const volScore=z.volume/maxZoneVol;
+    const score=Math.round(
+      z.sourceWeight*8+
+      z.touches*2.8+
+      z.rejections*8.5+
+      volScore*25+
+      distScore*14+
+      recencyScore*9-
+      z.breaks*7.5,
+    );
+
+    if(score<18){continue;}
+
     const zone={
-      id:`${type}-${r.center}`,
-      type,
-      center:r.center,
-      priceLow:r.center-half,
-      priceHigh:r.center+half,
-      score:Math.round(score),
-      touches:r.touches,
-      rejections:rej,
-      volume:r.vol,
+      id:`${z.kind}-${z.center}`,
+      type:z.kind,
+      center:z.center,
+      priceLow:z.center-zoneHalf,
+      priceHigh:z.center+zoneHalf,
+      score,
+      touches:z.touches,
+      rejections:z.rejections,
+      breaks:z.breaks,
+      volume:z.volume,
     };
-    if(type==='support'){rawSupport.push(zone);}else{rawResistance.push(zone);}
+    if(z.kind==='support'){supportRaw.push(zone);}else{resistanceRaw.push(zone);}
   }
 
-  rawSupport.sort((a,b)=>b.score-a.score);
-  rawResistance.sort((a,b)=>b.score-a.score);
-  const minDistance=Math.max(binSize*1.08,cfg.tickSize*4);
+  supportRaw.sort((a,b)=>b.score-a.score);
+  resistanceRaw.sort((a,b)=>b.score-a.score);
+  const minDistance=Math.max(binSize*1.4,cfg.tickSize*5);
 
-  const support=selectDistinctZones(rawSupport,4,minDistance).sort((a,b)=>b.center-a.center);
-  const resistance=selectDistinctZones(rawResistance,4,minDistance).sort((a,b)=>a.center-b.center);
+  const support=selectDistinctZones(supportRaw,4,minDistance).sort((a,b)=>b.center-a.center);
+  const resistance=selectDistinctZones(resistanceRaw,4,minDistance).sort((a,b)=>a.center-b.center);
   return{support,resistance,binSize};
 }
 
@@ -531,6 +727,154 @@ function nearestCandlePrice(candles,ts,fallbackPrice){
   }
   return best.close;
 }
+
+function detectCandlestickPatternBreakouts(candles,cfg){
+  const out=[];
+  if(!Array.isArray(candles)||candles.length<8){return out;}
+  const bars=candles.slice(-220);
+  const tick=Math.max(cfg.tickSize,1e-9);
+  const avgRange=mean(bars.map((b)=>Math.max(b.high-b.low,tick)))||tick*8;
+  const seen=new Set();
+
+  const pushPattern=(pattern)=>{
+    if(!pattern||!Number.isFinite(pattern.breakoutTs)||!Number.isFinite(pattern.breakoutPrice)){return;}
+    const crowded=out.some((x)=>x.side===pattern.side&&Math.abs(x.breakoutTs-pattern.breakoutTs)<TIMEFRAME_LOOKUP['5m'].ms&&Math.abs(x.breakoutPrice-pattern.breakoutPrice)<=avgRange*0.45);
+    if(crowded){return;}
+    const key=`${pattern.type}-${pattern.side}-${pattern.breakoutTs}`;
+    if(seen.has(key)){return;}
+    seen.add(key);
+    out.push(pattern);
+  };
+
+  for(let i=1;i<bars.length-2;i+=1){
+    const prev=bars[i-1];
+    const cur=bars[i];
+    const prevBody=Math.abs(prev.close-prev.open);
+    const curBody=Math.abs(cur.close-cur.open);
+    const range=Math.max(cur.high-cur.low,tick);
+    const lowerWick=Math.max(0,Math.min(cur.open,cur.close)-cur.low);
+    const upperWick=Math.max(0,cur.high-Math.max(cur.open,cur.close));
+
+    // Bullish/Bearish engulfing with breakout confirmation.
+    if(prev.close<prev.open&&cur.close>cur.open&&cur.open<=prev.close&&cur.close>=prev.open&&curBody>=prevBody*1.02){
+      const zoneHigh=Math.max(prev.high,cur.high);
+      const zoneLow=Math.min(prev.low,cur.low);
+      for(let j=i+1;j<Math.min(bars.length,i+9);j+=1){
+        if(bars[j].close>zoneHigh+tick*0.12){
+          pushPattern({
+            id:`bull-engulf-${bars[j].ts}`,
+            type:'Bullish Engulfing',
+            short:'ENG',
+            side:'buy',
+            setupTs:cur.ts,
+            breakoutTs:bars[j].ts,
+            breakoutPrice:zoneHigh,
+            zoneLow,zoneHigh,
+            label:'ENG BO',
+            confidence:Math.min(100,Math.round(55+curBody/Math.max(tick,prevBody)*18)),
+          });
+          break;
+        }
+      }
+    }
+    if(prev.close>prev.open&&cur.close<cur.open&&cur.open>=prev.close&&cur.close<=prev.open&&curBody>=prevBody*1.02){
+      const zoneHigh=Math.max(prev.high,cur.high);
+      const zoneLow=Math.min(prev.low,cur.low);
+      for(let j=i+1;j<Math.min(bars.length,i+9);j+=1){
+        if(bars[j].close<zoneLow-tick*0.12){
+          pushPattern({
+            id:`bear-engulf-${bars[j].ts}`,
+            type:'Bearish Engulfing',
+            short:'ENG',
+            side:'sell',
+            setupTs:cur.ts,
+            breakoutTs:bars[j].ts,
+            breakoutPrice:zoneLow,
+            zoneLow,zoneHigh,
+            label:'ENG BO',
+            confidence:Math.min(100,Math.round(55+curBody/Math.max(tick,prevBody)*18)),
+          });
+          break;
+        }
+      }
+    }
+
+    // Inside-bar breakout (mother bar levels as breakout zone).
+    const motherRange=Math.max(prev.high-prev.low,tick);
+    if(cur.high<prev.high&&cur.low>prev.low&&motherRange>=avgRange*0.85){
+      const zoneHigh=prev.high;
+      const zoneLow=prev.low;
+      for(let j=i+1;j<Math.min(bars.length,i+9);j+=1){
+        const up=bars[j].close>zoneHigh+tick*0.12;
+        const down=bars[j].close<zoneLow-tick*0.12;
+        if(!up&&!down){continue;}
+        const side=up?'buy':'sell';
+        const breakoutPrice=up?zoneHigh:zoneLow;
+        pushPattern({
+          id:`inside-bar-${side}-${bars[j].ts}`,
+          type:'Inside Bar Breakout',
+          short:'IB',
+          side,
+          setupTs:cur.ts,
+          breakoutTs:bars[j].ts,
+          breakoutPrice,
+          zoneLow,zoneHigh,
+          label:'IB BO',
+          confidence:62,
+        });
+        break;
+      }
+    }
+
+    // Pin-bar breakout (hammer/shooting-star style).
+    const bullPin=lowerWick>=Math.max(tick,curBody*2.4)&&lowerWick/range>=0.55&&cur.close>=cur.open;
+    const bearPin=upperWick>=Math.max(tick,curBody*2.4)&&upperWick/range>=0.55&&cur.close<=cur.open;
+    if(bullPin){
+      for(let j=i+1;j<Math.min(bars.length,i+7);j+=1){
+        if(bars[j].close>cur.high+tick*0.12){
+          pushPattern({
+            id:`hammer-${bars[j].ts}`,
+            type:'Hammer Breakout',
+            short:'HAM',
+            side:'buy',
+            setupTs:cur.ts,
+            breakoutTs:bars[j].ts,
+            breakoutPrice:cur.high,
+            zoneLow:cur.low,
+            zoneHigh:cur.high,
+            label:'HAM BO',
+            confidence:60,
+          });
+          break;
+        }
+      }
+    }else if(bearPin){
+      for(let j=i+1;j<Math.min(bars.length,i+7);j+=1){
+        if(bars[j].close<cur.low-tick*0.12){
+          pushPattern({
+            id:`shooting-star-${bars[j].ts}`,
+            type:'Shooting Star Breakout',
+            short:'STAR',
+            side:'sell',
+            setupTs:cur.ts,
+            breakoutTs:bars[j].ts,
+            breakoutPrice:cur.low,
+            zoneLow:cur.low,
+            zoneHigh:cur.high,
+            label:'STAR BO',
+            confidence:60,
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  out.sort((a,b)=>a.breakoutTs-b.breakoutTs);
+  pruneByLength(out,28);
+  return out;
+}
+
 function computeConfluenceSignals(s,timeframeKey,candles,cvd,zones){
   const signals=[];
   if(candles.length<24||cvd.length<24){return signals;}
@@ -624,14 +968,311 @@ function computeConfluenceSignals(s,timeframeKey,candles,cvd,zones){
   return merged;
 }
 
+function computeFinalDecision(s,timeframeKey,candles,zones,signals,patterns,orderBook,volumeProfile,now=Date.now()){
+  const timeframeMs=TIMEFRAME_LOOKUP[timeframeKey]?.ms||60000;
+  const latest=candles[candles.length-1];
+  const emptyDecision={
+    side:'wait',
+    confidence:0,
+    buyScore:0,
+    sellScore:0,
+    reasons:['Waiting for enough aligned orderflow evidence'],
+    timeframe:timeframeKey,
+    ts:now,
+  };
+  if(!latest){return emptyDecision;}
+
+  const contributions=[];
+  const componentTotals=new Map();
+  let uncertaintyPenalty=0;
+
+  const addContribution=(side,weight,reason,component)=>{
+    if((side!=='buy'&&side!=='sell')||!Number.isFinite(weight)||weight<=0){return;}
+    const safeWeight=Math.max(0,weight);
+    contributions.push({side,weight:safeWeight,reason,component});
+    if(!componentTotals.has(component)){componentTotals.set(component,{buy:0,sell:0});}
+    componentTotals.get(component)[side]+=safeWeight;
+  };
+
+  // Flow momentum (OFI / TFI + quote-to-trade quality).
+  const flow=computeFlowMetrics(s,now);
+  const ofiBase=Math.max(10,flow.ofiAbsBaseline*1.35,s.cfg.tickSize*20);
+  const tfiBase=Math.max(10,flow.tfiAbsBaseline*1.3,s.cfg.tickSize*16);
+  const ofiNorm=Math.abs(flow.ofi10s)/ofiBase;
+  const tfiNorm=Math.abs(flow.tfi10s)/tfiBase;
+  const flowStrength=Math.min(1.65,ofiNorm*0.72+tfiNorm*0.58);
+  const flowBias=flow.ofi10s*0.58+flow.tfi10s*0.95;
+  if(flowStrength>=0.2){
+    const flowWeight=8+flowStrength*20;
+    if(flowBias>0){
+      addContribution('buy',flowWeight,`Aggressive buy flow (OFI ${fmt(flow.ofi10s,0)}, TFI ${fmt(flow.tfi10s,0)})`,'flow');
+    }else if(flowBias<0){
+      addContribution('sell',flowWeight,`Aggressive sell flow (OFI ${fmt(flow.ofi10s,0)}, TFI ${fmt(flow.tfi10s,0)})`,'flow');
+    }
+  }
+  const oppositeFlow=Math.sign(flow.ofi10s)!==0&&Math.sign(flow.tfi10s)!==0&&Math.sign(flow.ofi10s)!==Math.sign(flow.tfi10s);
+  if(oppositeFlow){uncertaintyPenalty+=7;}
+  const spoofRisk=flow.quoteTradeRatio30s>SPOOFING_QTR_THRESHOLD&&Math.abs(flow.ofi10s)>Math.max(20,Math.abs(flow.tfi10s)*1.8);
+  if(spoofRisk){uncertaintyPenalty+=10;}
+
+  // Order book pressure and quality.
+  if(orderBook){
+    const imbalance=Number.isFinite(orderBook.imbalance)?orderBook.imbalance:0;
+    const imbalanceStrength=Math.min(1.45,Math.abs(imbalance)/0.19);
+    if(imbalanceStrength>0.18){
+      const weight=6+imbalanceStrength*14;
+      if(imbalance>0){
+        addContribution('buy',weight,`Order book bid imbalance ${fmt(imbalance*100,2)}%`,'orderbook');
+      }else if(imbalance<0){
+        addContribution('sell',weight,`Order book ask imbalance ${fmt(imbalance*100,2)}%`,'orderbook');
+      }
+    }
+
+    const nearDepth=6;
+    const bidNear=sum((orderBook.bids||[]).slice(0,nearDepth).map((l)=>l.qty||0));
+    const askNear=sum((orderBook.asks||[]).slice(0,nearDepth).map((l)=>l.qty||0));
+    const nearDen=bidNear+askNear;
+    if(nearDen>0){
+      const microImbalance=(bidNear-askNear)/nearDen;
+      const strength=Math.min(1.2,Math.abs(microImbalance)/0.22);
+      if(strength>0.2){
+        const weight=4+strength*10;
+        if(microImbalance>0){
+          addContribution('buy',weight,'Top-of-book liquidity leaning bids','orderbook');
+        }else if(microImbalance<0){
+          addContribution('sell',weight,'Top-of-book liquidity leaning asks','orderbook');
+        }
+      }
+    }
+
+    if(Number.isFinite(orderBook.spreadPct)&&orderBook.spreadPct>0.0009){uncertaintyPenalty+=6;}
+    if(Number.isFinite(orderBook.depthDispersion)&&orderBook.depthDispersion>1.35){uncertaintyPenalty+=5;}
+  }
+
+  // Confluence signals (decayed by age).
+  const recentSignals=(signals||[]).slice(-16);
+  for(const sig of recentSignals){
+    if(!Number.isFinite(sig.ts)||!Number.isFinite(sig.score)){continue;}
+    const ageBars=Math.max(0,(now-sig.ts)/timeframeMs);
+    if(ageBars>18){continue;}
+    const decay=Math.max(0.15,1-ageBars/20);
+    const strength=Math.max(0,(sig.score-42)/42);
+    const side=sig.side==='buy'?'buy':'sell';
+    const weight=(6+strength*16)*decay;
+    const sourceLabel=sig.source==='detector'?'Detector':'Confluence';
+    addContribution(side,weight,`${sourceLabel} ${side} score ${Math.round(sig.score)}`,'signals');
+  }
+
+  // Pattern breakouts (engulfing / inside bar / pin bar etc.).
+  const recentPatterns=(patterns||[]).slice(-12);
+  for(const p of recentPatterns){
+    if(!Number.isFinite(p.breakoutTs)){continue;}
+    const ageBars=Math.max(0,(now-p.breakoutTs)/timeframeMs);
+    if(ageBars>24){continue;}
+    const decay=Math.max(0.2,1-ageBars/26);
+    const confidence=Number.isFinite(p.confidence)?p.confidence:60;
+    const weight=(4+Math.max(0,confidence-45)/5)*decay;
+    const side=p.side==='buy'?'buy':'sell';
+    addContribution(side,weight,`${p.type} breakout`,'patterns');
+  }
+
+  // Volume profile + live resting liquidity near current price.
+  if(volumeProfile&&Array.isArray(volumeProfile.rows)&&volumeProfile.rows.length>0){
+    const profileDelta=Number(volumeProfile.stats?.delta)||0;
+    const totalProfileVolume=Math.max(1,Number(volumeProfile.stats?.totalVolume)||1);
+    const deltaStrength=Math.min(1.5,Math.abs(profileDelta)/Math.max(1,totalProfileVolume*0.09));
+    if(deltaStrength>0.08){
+      const weight=5+deltaStrength*12;
+      if(profileDelta>0){
+        addContribution('buy',weight,`Volume profile delta +${fmt(profileDelta,0)}`,'volumeProfile');
+      }else if(profileDelta<0){
+        addContribution('sell',weight,`Volume profile delta ${fmt(profileDelta,0)}`,'volumeProfile');
+      }
+    }
+
+    const pocPrice=volumeProfile.poc?.price;
+    if(Number.isFinite(pocPrice)){
+      if(latest.close>pocPrice&&profileDelta>0){
+        addContribution('buy',6,'Price above POC with positive profile delta','volumeProfile');
+      }else if(latest.close<pocPrice&&profileDelta<0){
+        addContribution('sell',6,'Price below POC with negative profile delta','volumeProfile');
+      }
+    }
+
+    const vpBin=Math.max(s.cfg.tickSize,Number(volumeProfile.binSize)||s.cfg.tickSize);
+    const rowsNearPrice=volumeProfile.rows.filter((r)=>Math.abs((r.price||0)-latest.close)<=vpBin*2.1);
+    if(rowsNearPrice.length>0){
+      const liveBids=sum(rowsNearPrice.map((r)=>r.bookBid||0));
+      const liveAsks=sum(rowsNearPrice.map((r)=>r.bookAsk||0));
+      const den=liveBids+liveAsks;
+      if(den>0){
+        const liveImbalance=(liveBids-liveAsks)/den;
+        const strength=Math.min(1.2,Math.abs(liveImbalance)/0.2);
+        if(strength>0.12){
+          const weight=4+strength*9;
+          if(liveImbalance>0){
+            addContribution('buy',weight,'Resting liquidity supports downside','volumeProfile');
+          }else if(liveImbalance<0){
+            addContribution('sell',weight,'Resting liquidity caps upside','volumeProfile');
+          }
+        }
+      }
+    }
+  }
+
+  // Support / resistance reaction context.
+  const nearRange=mean(candles.slice(-18).map((c)=>Math.max(c.high-c.low,s.cfg.tickSize)))||s.cfg.tickSize*8;
+  const nearThreshold=Math.max(nearRange*0.55,s.cfg.tickSize*5);
+  const nearestSupport=(zones?.support||[])
+    .slice()
+    .sort((a,b)=>Math.abs(latest.close-a.center)-Math.abs(latest.close-b.center))[0];
+  const nearestResistance=(zones?.resistance||[])
+    .slice()
+    .sort((a,b)=>Math.abs(latest.close-a.center)-Math.abs(latest.close-b.center))[0];
+
+  if(nearestSupport){
+    const d=Math.abs(latest.close-nearestSupport.center);
+    const inZone=latest.low<=nearestSupport.priceHigh&&latest.high>=nearestSupport.priceLow;
+    if(d<=nearThreshold||inZone){
+      const proximity=1-Math.min(1,d/Math.max(nearThreshold,1e-9));
+      const zoneScore=Math.max(0,(nearestSupport.score||0)-18);
+      addContribution('buy',5+proximity*11+zoneScore/14,'Reaction at support zone','zones');
+    }
+  }
+  if(nearestResistance){
+    const d=Math.abs(latest.close-nearestResistance.center);
+    const inZone=latest.low<=nearestResistance.priceHigh&&latest.high>=nearestResistance.priceLow;
+    if(d<=nearThreshold||inZone){
+      const proximity=1-Math.min(1,d/Math.max(nearThreshold,1e-9));
+      const zoneScore=Math.max(0,(nearestResistance.score||0)-18);
+      addContribution('sell',5+proximity*11+zoneScore/14,'Reaction at resistance zone','zones');
+    }
+  }
+
+  // Recent detector alerts (absorption, sweep, dislocation, stacked imbalance...).
+  const recentAlerts=(s.alerts||[]).slice(-40);
+  for(const alert of recentAlerts){
+    if(!Number.isFinite(alert.ts)){continue;}
+    if(now-alert.ts>timeframeMs*14){continue;}
+    if(alert.bias!=='bullish'&&alert.bias!=='bearish'){continue;}
+    const ageBars=Math.max(0,(now-alert.ts)/timeframeMs);
+    const decay=Math.max(0.1,1-ageBars/16);
+    const base=alert.severity==='high'?8.5:5.5;
+    const side=alert.bias==='bullish'?'buy':'sell';
+    addContribution(side,base*decay,`${alert.type}`,'alerts');
+  }
+
+  // Short-term candle initiative.
+  if(candles.length>=3){
+    const last3=candles.slice(-3);
+    const closeDrift=last3[last3.length-1].close-last3[0].open;
+    const deltaDrift=sum(last3.map((c)=>c.delta));
+    const upCloses=last3.filter((c)=>c.close>=c.open).length;
+    const downCloses=last3.length-upCloses;
+    const recentRange=mean(last3.map((c)=>Math.max(c.high-c.low,s.cfg.tickSize)));
+    if(closeDrift>recentRange*0.18&&deltaDrift>0&&upCloses>=2){
+      addContribution('buy',6.5,'Recent candles show upward initiative','candles');
+    }else if(closeDrift<-recentRange*0.18&&deltaDrift<0&&downCloses>=2){
+      addContribution('sell',6.5,'Recent candles show downward initiative','candles');
+    }
+  }
+
+  const buyRaw=sum(contributions.filter((c)=>c.side==='buy').map((c)=>c.weight));
+  const sellRaw=sum(contributions.filter((c)=>c.side==='sell').map((c)=>c.weight));
+  const totalRaw=buyRaw+sellRaw;
+  if(totalRaw<=0){
+    return emptyDecision;
+  }
+
+  let conflictingComponents=0;
+  let alignedComponents=0;
+  for(const totals of componentTotals.values()){
+    const mx=Math.max(totals.buy,totals.sell);
+    const mn=Math.min(totals.buy,totals.sell);
+    if(mx<=0){continue;}
+    if(mn>0&&mx/mn<1.45){conflictingComponents+=1;}else{alignedComponents+=1;}
+  }
+
+  const dominantSide=buyRaw>=sellRaw?'buy':'sell';
+  const dominantRaw=Math.max(buyRaw,sellRaw);
+  const gap=Math.abs(buyRaw-sellRaw);
+  const gapPct=gap/Math.max(1,totalRaw);
+  const evidenceCoverage=Math.min(1,totalRaw/110);
+  const agreement=alignedComponents/Math.max(1,alignedComponents+conflictingComponents);
+
+  let confidence=Math.round(clamp(
+    24+gapPct*52+evidenceCoverage*26+agreement*12-uncertaintyPenalty,
+    12,
+    98,
+  ));
+
+  let side='wait';
+  if(gapPct>=0.18&&dominantRaw>=24){
+    side=dominantSide;
+  }else{
+    confidence=Math.min(confidence,58);
+  }
+  if(spoofRisk&&confidence<72){
+    side='wait';
+    confidence=Math.min(confidence,56);
+  }
+
+  const topReasons=(forSide,maxCount)=>{
+    return contributions
+      .filter((c)=>c.side===forSide)
+      .sort((a,b)=>b.weight-a.weight)
+      .slice(0,maxCount)
+      .map((c)=>c.reason);
+  };
+
+  let reasons=[];
+  if(side==='buy'||side==='sell'){
+    reasons=topReasons(side,4);
+    if(reasons.length===0){reasons=['Directional edge exists but reasons are sparse'];}
+  }else{
+    const topBuy=topReasons('buy',1)[0];
+    const topSell=topReasons('sell',1)[0];
+    if(topBuy&&topSell){
+      reasons=[`Mixed pressure: ${topBuy} vs ${topSell}`];
+    }else{
+      reasons=['Waiting for enough aligned orderflow evidence'];
+    }
+  }
+
+  return{
+    side,
+    confidence,
+    buyScore:Math.round((buyRaw/Math.max(1,totalRaw))*1000)/10,
+    sellScore:Math.round((sellRaw/Math.max(1,totalRaw))*1000)/10,
+    reasons,
+    timeframe:timeframeKey,
+    ts:now,
+    meta:{
+      quoteTradeRatio30s:flow.quoteTradeRatio30s,
+      spoofRisk,
+      componentAgreement:Math.round(agreement*100),
+    },
+  };
+}
+
 function buildZoneHints(s){
   const candles=buildCandlesFromFrame(s,'5m',140);
   const model=buildZoneModel(candles,s.cfg,s.lastPrice);
   return{nearestSupport:model.support[0]||null,nearestResistance:model.resistance[0]||null};
 }
 
+function computeDepthDispersionFromState(s){
+  const vals=[...(s.orderBook?.bids||[]),...(s.orderBook?.asks||[])].map((x)=>x.qty).filter((v)=>Number.isFinite(v)&&v>0);
+  if(vals.length===0){return 0;}
+  const m=mean(vals);
+  if(m<=0){return 0;}
+  const variance=mean(vals.map((v)=>(v-m)**2));
+  return Math.sqrt(variance)/m;
+}
+
 function buildSymbolSummary(s,now){
   const zoneHints=buildZoneHints(s);
+  const flow=computeFlowMetrics(s,now);
   return{
     symbol:s.symbol,
     price:s.lastPrice,
@@ -640,6 +1281,10 @@ function buildSymbolSummary(s,now){
     bidLiquidity:s.topBidQty5,
     askLiquidity:s.topAskQty5,
     delta15s:s.tradeWindow.filter((t)=>now-t.ts<=15000).reduce((sum,t)=>sum+t.deltaQty,0),
+    ofi10s:flow.ofi10s,
+    tfi10s:flow.tfi10s,
+    quoteTradeRatio30s:flow.quoteTradeRatio30s,
+    depthDispersion:computeDepthDispersionFromState(s),
     alerts:s.alerts.slice(-30).reverse(),
     zones:zoneHints,
   };
@@ -651,6 +1296,7 @@ function buildDetail(s,timeframeKey){
   const bubbles=[];
   const orderBook=buildOrderBookDetail(s);
   const volumeProfile=buildVolumeProfile(s,candles,orderBook);
+  const now=Date.now();
 
   for(const c of candles){
     const levels=[...c.levels.entries()]
@@ -677,9 +1323,11 @@ function buildDetail(s,timeframeKey){
   }));
 
   const zones=buildZoneModel(cleanCandles,s.cfg,s.lastPrice);
+  const patterns=detectCandlestickPatternBreakouts(cleanCandles,s.cfg);
   const signals=computeConfluenceSignals(s,timeframeKey,cleanCandles,cvd,zones);
+  const decision=computeFinalDecision(s,timeframeKey,cleanCandles,zones,signals,patterns,orderBook,volumeProfile,now);
 
-  return{symbol:s.symbol,timeframe:timeframeKey,candles:cleanCandles,cvd,bubbles,zones,signals,orderBook,volumeProfile};
+  return{symbol:s.symbol,timeframe:timeframeKey,candles:cleanCandles,cvd,bubbles,zones,patterns,signals,decision,orderBook,volumeProfile};
 }
 function normalizeSubscription(msg){
   const requestedSymbol=typeof msg.symbol==='string'?msg.symbol:DEFAULT_SYMBOL;
@@ -760,8 +1408,12 @@ setInterval(()=>{
   Object.values(state).forEach((s)=>{
     pruneByAge(s.tradeWindow,now,20000);
     pruneByAge(s.priceWindow,now,70000);
+    pruneByAge(s.tfiEvents,now,FLOW_WINDOW_BASELINE_MS+FLOW_WINDOW_LONG_MS);
+    pruneByAge(s.ofiEvents,now,FLOW_WINDOW_BASELINE_MS+FLOW_WINDOW_LONG_MS);
+    pruneByAge(s.quoteEvents,now,FLOW_WINDOW_BASELINE_MS+FLOW_WINDOW_LONG_MS);
     detectSweep(s,now);
     detectAbsorption(s,now);
+    detectFlowDislocation(s,now);
   });
   broadcastSnapshots();
 },SNAPSHOT_INTERVAL_MS);

@@ -4,7 +4,6 @@
   symbols:[],
   timeframes:[],
   defaults:{symbol:'BTCUSD',timeframe:'1m'},
-  binanceSymbols:{},
   summary:{},
   priceMoves:{},
   detail:null,
@@ -16,21 +15,22 @@ const tvChart={
   wrap:document.querySelector('.canvas-wrap'),
   chart:null,
   candleSeries:null,
-  cvdSeries:null,
   overlayCanvas:document.getElementById('footprintOverlay'),
   overlayCtx:null,
   overlayDetail:null,
   overlayScheduled:false,
   zoneLines:[],
+  patternLines:[],
   lastPriceLine:null,
   hasFittedOnce:false,
   lastSymbol:'',
   lastTimeframe:'',
   currentDigits:null,
+  realtimePulsePhase:0,
+  lastCandleTime:null,
 };
 
 const connectionStatusEl=document.getElementById('connectionStatus');
-const binanceMapEl=document.getElementById('binanceMap');
 const symbolTabsEl=document.getElementById('symbolTabs');
 const timeframeTabsEl=document.getElementById('timeframeTabs');
 const metricPriceEl=document.getElementById('metricPrice');
@@ -42,6 +42,10 @@ const metricBidLiqEl=document.getElementById('metricBidLiq');
 const metricAskLiqEl=document.getElementById('metricAskLiq');
 const metricSupportEl=document.getElementById('metricSupport');
 const metricResistanceEl=document.getElementById('metricResistance');
+const finalSignalCardEl=document.getElementById('finalSignalCard');
+const finalSignalSideEl=document.getElementById('finalSignalSide');
+const finalSignalConfidenceEl=document.getElementById('finalSignalConfidence');
+const finalSignalMetaEl=document.getElementById('finalSignalMeta');
 const alertsListEl=document.getElementById('alertsList');
 const orderBookSpreadEl=document.getElementById('orderBookSpread');
 const orderBookImbalanceEl=document.getElementById('orderBookImbalance');
@@ -54,6 +58,35 @@ const vpDeltaEl=document.getElementById('vpDelta');
 const vpBinSizeEl=document.getElementById('vpBinSize');
 const vpTotalVolumeEl=document.getElementById('vpTotalVolume');
 const volumeProfileRowsEl=document.getElementById('volumeProfileRows');
+const chartTitleEl=document.getElementById('chartTitle');
+const chartTimeZoneEl=document.getElementById('chartTimeZone');
+
+const IST_TIMEZONE='Asia/Kolkata';
+const IST_TIME_FORMATTER=new Intl.DateTimeFormat('en-IN',{
+  timeZone:IST_TIMEZONE,
+  hour:'2-digit',
+  minute:'2-digit',
+  second:'2-digit',
+  hour12:false,
+});
+const IST_DATE_TIME_FORMATTER=new Intl.DateTimeFormat('en-IN',{
+  timeZone:IST_TIMEZONE,
+  day:'2-digit',
+  month:'short',
+  hour:'2-digit',
+  minute:'2-digit',
+  hour12:false,
+});
+const IST_DATE_FORMATTER=new Intl.DateTimeFormat('en-IN',{
+  timeZone:IST_TIMEZONE,
+  day:'2-digit',
+  month:'short',
+});
+const IST_HOUR_FORMATTER=new Intl.DateTimeFormat('en-IN',{
+  timeZone:IST_TIMEZONE,
+  hour:'2-digit',
+  hour12:false,
+});
 
 function fmt(value,digits=2){
   if(!Number.isFinite(value)){return '-';}
@@ -67,6 +100,20 @@ function fmtShort(value){
   if(abs>=1_000_000){return `${(value/1_000_000).toFixed(2)}M`;}
   if(abs>=1_000){return `${(value/1_000).toFixed(2)}K`;}
   return value.toFixed(2);
+}
+
+function chartTimeToDate(time){
+  if(typeof time==='number'&&Number.isFinite(time)){return new Date(time*1000);}
+  if(time&&typeof time==='object'&&Number.isFinite(time.year)&&Number.isFinite(time.month)&&Number.isFinite(time.day)){
+    return new Date(Date.UTC(time.year,time.month-1,time.day));
+  }
+  return null;
+}
+
+function formatChartTimeIst(time,withDate=false){
+  const d=chartTimeToDate(time);
+  if(!d){return '';}
+  return withDate?IST_DATE_TIME_FORMATTER.format(d):IST_TIME_FORMATTER.format(d);
 }
 
 function setStatus(text,cls){
@@ -181,6 +228,28 @@ function renderMetrics(summary,priceMove){
   }
 }
 
+function renderFinalSignal(decision){
+  if(!finalSignalCardEl||!finalSignalSideEl||!finalSignalConfidenceEl||!finalSignalMetaEl){return;}
+
+  const safe=decision&&typeof decision==='object'?decision:{};
+  const rawSide=String(safe.side||'wait').toLowerCase();
+  const side=rawSide==='buy'||rawSide==='sell'?rawSide:'wait';
+  const confidence=Number.isFinite(safe.confidence)?Math.max(0,Math.min(100,Math.round(safe.confidence))):0;
+  const buyScore=Number.isFinite(safe.buyScore)?safe.buyScore:0;
+  const sellScore=Number.isFinite(safe.sellScore)?safe.sellScore:0;
+  const reasons=Array.isArray(safe.reasons)?safe.reasons.filter((x)=>typeof x==='string'&&x.trim()):[];
+  const ts=Number.isFinite(safe.ts)?safe.ts:Date.now();
+
+  finalSignalCardEl.className=`final-signal-card ${side}`;
+  finalSignalSideEl.textContent=side.toUpperCase();
+  finalSignalConfidenceEl.textContent=`${confidence}%`;
+
+  const headline=`Buy ${fmt(buyScore,1)} / Sell ${fmt(sellScore,1)}`;
+  const reasonText=reasons.slice(0,2).join(' | ');
+  const stamp=`${IST_TIME_FORMATTER.format(new Date(ts))} IST`;
+  finalSignalMetaEl.textContent=reasonText?`${headline} | ${reasonText} | ${stamp}`:`${headline} | ${stamp}`;
+}
+
 function renderAlerts(alerts){
   const list=alerts||[];
   alertsListEl.innerHTML='';
@@ -203,7 +272,7 @@ function renderAlerts(alerts){
     left.textContent=`${alert.type} - ${String(alert.bias||'').toUpperCase()}`;
 
     const right=document.createElement('span');
-    right.textContent=new Date(alert.ts).toLocaleTimeString();
+    right.textContent=`${IST_TIME_FORMATTER.format(new Date(alert.ts))} IST`;
 
     meta.append(left,right);
 
@@ -237,7 +306,14 @@ function renderOrderBook(orderBook,summary){
   if(imbalance>0.03){orderBookImbalanceEl.classList.add('bull');}
   if(imbalance<-0.03){orderBookImbalanceEl.classList.add('bear');}
 
-  orderBookSpeedEl.textContent=`Speed ${fmt(orderBook.speed,2)} upd/s`;
+  const flowOfi=summary?.ofi10s;
+  const flowTfi=summary?.tfi10s;
+  const qtr=summary?.quoteTradeRatio30s;
+  const dispersion=Number.isFinite(orderBook.depthDispersion)?orderBook.depthDispersion:summary?.depthDispersion;
+  const flowText=Number.isFinite(flowOfi)&&Number.isFinite(flowTfi)?` OFI ${fmt(flowOfi,0)} / TFI ${fmt(flowTfi,0)}`:'';
+  const qtrText=Number.isFinite(qtr)?` | Q/T ${fmt(qtr,2)}`:'';
+  const dispersionText=Number.isFinite(dispersion)?` | Disp ${fmt(dispersion,2)}`:'';
+  orderBookSpeedEl.textContent=`Speed ${fmt(orderBook.speed,2)} upd/s${flowText}${qtrText}${dispersionText}`;
   const maxQty=Math.max(1,orderBook.maxQty||1);
 
   function buildRows(levels,side){
@@ -321,6 +397,15 @@ function renderVolumeProfile(profile,summary){
   volumeProfileRowsEl.innerHTML=header+rowsHtml;
 }
 
+function renderChartTitle(summary){
+  if(chartTitleEl){
+    chartTitleEl.textContent=`${state.selectedSymbol} Orderflow Chart (${state.selectedTimeframe})`;
+  }
+  if(chartTimeZoneEl){
+    chartTimeZoneEl.textContent=`Time Zone: IST (Asia/Kolkata) ${IST_TIME_FORMATTER.format(new Date())}`;
+  }
+}
+
 function lightweight(){
   return window.LightweightCharts||null;
 }
@@ -393,8 +478,10 @@ function drawFootprintOverlay(detail){
   if(!detail||!Array.isArray(detail.bubbles)||detail.bubbles.length===0||!tvChart.chart||!tvChart.candleSeries){return;}
   const maxAbs=Math.max(1,...detail.bubbles.map((b)=>b.absDelta||Math.abs(b.delta)||1));
   const bubbles=detail.bubbles.slice(-1800);
+  const currentBarTs=detail?.candles?.[detail.candles.length-1]?.ts??null;
 
   for(const b of bubbles){
+    if(currentBarTs&&b.ts===currentBarTs){continue;}
     const x=tvChart.chart.timeScale().timeToCoordinate(msToSec(b.ts));
     const y=tvChart.candleSeries.priceToCoordinate(b.price);
     if(!Number.isFinite(x)||!Number.isFinite(y)){continue;}
@@ -408,18 +495,36 @@ function drawFootprintOverlay(detail){
     const rgb=buy?'22,163,74':'220,38,38';
 
     const glow=ctx.createRadialGradient(x,y,1,x,y,rx*1.7);
-    glow.addColorStop(0,`rgba(${rgb},${0.24+strength*0.28})`);
+    glow.addColorStop(0,`rgba(${rgb},${0.18+strength*0.22})`);
     glow.addColorStop(1,`rgba(${rgb},0)`);
     ctx.fillStyle=glow;
     ctx.beginPath();
     ctx.arc(x,y,rx*1.7,0,Math.PI*2);
     ctx.fill();
 
-    ctx.fillStyle=`rgba(${rgb},${0.17+strength*0.36})`;
+    ctx.fillStyle=`rgba(${rgb},${0.12+strength*0.24})`;
     ctx.fillRect(x-rx,y-ry,rx*2,ry*2);
-    ctx.strokeStyle=`rgba(${rgb},${0.30+strength*0.36})`;
+    ctx.strokeStyle=`rgba(${rgb},${0.20+strength*0.30})`;
     ctx.lineWidth=1;
     ctx.strokeRect(x-rx,y-ry,rx*2,ry*2);
+  }
+
+  const lastCandle=detail?.candles?.[detail.candles.length-1];
+  if(lastCandle){
+    const x=tvChart.chart.timeScale().timeToCoordinate(msToSec(lastCandle.ts));
+    const y=tvChart.candleSeries.priceToCoordinate(lastCandle.close);
+    if(Number.isFinite(x)&&Number.isFinite(y)){
+      const pulse=4+Math.abs(Math.sin(Date.now()/280))*5;
+      ctx.beginPath();
+      ctx.arc(x,y,pulse,0,Math.PI*2);
+      ctx.fillStyle='rgba(59,130,246,0.22)';
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(x,y,2.4,0,Math.PI*2);
+      ctx.fillStyle='rgba(59,130,246,0.90)';
+      ctx.fill();
+    }
   }
 }
 
@@ -472,6 +577,62 @@ function applyZoneLines(zones){
   });
 }
 
+function clearPatternLines(){
+  if(!tvChart.candleSeries){return;}
+  tvChart.patternLines.forEach((line)=>{
+    try{tvChart.candleSeries.removePriceLine(line);}catch{}
+  });
+  tvChart.patternLines=[];
+}
+
+function applyPatternAnnotations(patterns){
+  if(!tvChart.candleSeries){return;}
+  clearPatternLines();
+  const recent=(patterns||[]).slice(-3);
+
+  recent.forEach((p)=>{
+    const side=p.side==='buy'?'buy':'sell';
+    const color=side==='buy'?'rgba(14,116,144,0.82)':'rgba(185,28,28,0.82)';
+    const zoneColor=side==='buy'?'rgba(14,116,144,0.36)':'rgba(185,28,28,0.36)';
+
+    if(Number.isFinite(p.breakoutPrice)){
+      const boLine=tvChart.candleSeries.createPriceLine({
+        price:p.breakoutPrice,
+        color,
+        lineWidth:2,
+        lineStyle:1,
+        axisLabelVisible:true,
+        title:`${p.short||'PAT'} BO`,
+      });
+      tvChart.patternLines.push(boLine);
+    }
+
+    if(Number.isFinite(p.zoneHigh)){
+      const zhLine=tvChart.candleSeries.createPriceLine({
+        price:p.zoneHigh,
+        color:zoneColor,
+        lineWidth:1,
+        lineStyle:2,
+        axisLabelVisible:false,
+        title:'',
+      });
+      tvChart.patternLines.push(zhLine);
+    }
+
+    if(Number.isFinite(p.zoneLow)){
+      const zlLine=tvChart.candleSeries.createPriceLine({
+        price:p.zoneLow,
+        color:zoneColor,
+        lineWidth:1,
+        lineStyle:2,
+        axisLabelVisible:false,
+        title:'',
+      });
+      tvChart.patternLines.push(zlLine);
+    }
+  });
+}
+
 function updateLastPriceLine(price){
   if(!tvChart.candleSeries){return;}
   if(tvChart.lastPriceLine){
@@ -511,17 +672,31 @@ function initChart(){
     rightPriceScale:{
       visible:true,
       borderColor:'#d8e3f0',
-      scaleMargins:{top:0.06,bottom:0.08},
+      scaleMargins:{top:0.06,bottom:0.10},
+    },
+    localization:{
+      locale:'en-IN',
+      timeFormatter:(time)=>formatChartTimeIst(time,false),
     },
     timeScale:{
       borderColor:'#d8e3f0',
-      rightOffset:12,
+      rightOffset:18,
       barSpacing:8,
       minBarSpacing:3,
       timeVisible:true,
       secondsVisible:false,
       fixLeftEdge:false,
       fixRightEdge:false,
+      tickMarkFormatter:(time,tickMarkType)=>{
+        const isDateTick=tickMarkType==='DayOfMonth'||tickMarkType==='Month'||tickMarkType==='Year'||tickMarkType===0||tickMarkType===1||tickMarkType===2;
+        if(isDateTick){
+          return formatChartTimeIst(time,true);
+        }
+        const d=chartTimeToDate(time);
+        if(!d){return '';}
+        const hour=Number(IST_HOUR_FORMATTER.format(d));
+        return hour===0?IST_DATE_FORMATTER.format(d):IST_TIME_FORMATTER.format(d);
+      },
     },
     crosshair:{
       mode:0,
@@ -546,28 +721,6 @@ function initChart(){
     lastValueVisible:true,
     priceLineVisible:false,
   },0);
-
-  tvChart.cvdSeries=addSeriesCompat(tvChart.chart,'LineSeries',{
-    color:'#0369a1',
-    lineWidth:2,
-    priceLineVisible:false,
-    lastValueVisible:true,
-  },1);
-
-  if(tvChart.cvdSeries&&typeof tvChart.cvdSeries.priceScale==='function'){
-    try{tvChart.cvdSeries.priceScale().applyOptions({scaleMargins:{top:0.05,bottom:0.04}});}catch{}
-  }
-
-  if(tvChart.chart&&typeof tvChart.chart.panes==='function'){
-    try{
-      const panes=tvChart.chart.panes();
-      if(Array.isArray(panes)&&panes.length>1){
-        const fullH=Math.max(300,tvChart.root.clientHeight||640);
-        panes[0].setHeight(Math.round(fullH*0.74));
-        panes[1].setHeight(Math.round(fullH*0.26));
-      }
-    }catch{}
-  }
 
   const resize=()=>{
     if(!tvChart.chart||!tvChart.root){return;}
@@ -604,14 +757,14 @@ function renderChart(detail,summary){
   if(!tvChart.chart||!tvChart.candleSeries){return;}
 
   const candles=detail?.candles||[];
-  const cvd=detail?.cvd||[];
 
   if(candles.length===0){
     tvChart.candleSeries.setData([]);
-    if(tvChart.cvdSeries){tvChart.cvdSeries.setData([]);}
     setSeriesMarkersCompat(tvChart.candleSeries,[]);
     clearZoneLines();
+    clearPatternLines();
     updateLastPriceLine(null);
+    tvChart.lastCandleTime=null;
     tvChart.overlayDetail=null;
     requestFootprintOverlayDraw();
     return;
@@ -633,14 +786,26 @@ function renderChart(detail,summary){
     low:c.low,
     close:c.close,
   }));
-  tvChart.candleSeries.setData(candleData);
+  const symbolChanged=tvChart.lastSymbol!==detail?.symbol;
+  const tfChanged=tvChart.lastTimeframe!==detail?.timeframe;
+  const mustResetSeries=!tvChart.hasFittedOnce||symbolChanged||tfChanged||tvChart.lastCandleTime===null;
 
-  if(tvChart.cvdSeries){
-    const cvdData=cvd.map((x)=>({time:msToSec(x.ts),value:x.value}));
-    tvChart.cvdSeries.setData(cvdData);
+  if(mustResetSeries){
+    tvChart.candleSeries.setData(candleData);
+    tvChart.lastCandleTime=candleData[candleData.length-1]?.time??null;
+  }else{
+    const lastBar=candleData[candleData.length-1];
+    if(lastBar){
+      if(tvChart.lastCandleTime!==lastBar.time&&candleData.length>2){
+        tvChart.candleSeries.setData(candleData.slice(-260));
+      }else{
+        tvChart.candleSeries.update(lastBar);
+      }
+      tvChart.lastCandleTime=lastBar.time;
+    }
   }
 
-  const markers=(detail?.signals||[])
+  const signalMarkers=(detail?.signals||[])
     .slice(-120)
     .map((sig)=>({
       time:msToSec(sig.ts),
@@ -649,13 +814,23 @@ function renderChart(detail,summary){
       shape:sig.side==='buy'?'arrowUp':'arrowDown',
       text:`${sig.side==='buy'?'B':'S'}${Number.isFinite(sig.score)?` ${sig.score}`:''}`,
     }));
+  const patternMarkers=(detail?.patterns||[])
+    .slice(-60)
+    .filter((p)=>Number.isFinite(p.breakoutTs))
+    .map((p)=>({
+      time:msToSec(p.breakoutTs),
+      position:p.side==='buy'?'belowBar':'aboveBar',
+      color:p.side==='buy'?'#0369a1':'#b91c1c',
+      shape:'square',
+      text:p.label||`${p.short||'PAT'} BO`,
+    }));
+  const markers=[...signalMarkers,...patternMarkers];
   setSeriesMarkersCompat(tvChart.candleSeries,markers);
 
   applyZoneLines(detail?.zones);
+  applyPatternAnnotations(detail?.patterns);
   updateLastPriceLine(candles[candles.length-1]?.close);
 
-  const symbolChanged=tvChart.lastSymbol!==detail?.symbol;
-  const tfChanged=tvChart.lastTimeframe!==detail?.timeframe;
   if(!tvChart.hasFittedOnce||symbolChanged||tfChanged){
     tvChart.chart.timeScale().fitContent();
     tvChart.hasFittedOnce=true;
@@ -677,17 +852,16 @@ function renderChart(detail,summary){
 function render(){
   const summary=state.summary[state.selectedSymbol];
   const priceMove=state.priceMoves[state.selectedSymbol];
-  renderMetrics(summary,priceMove);
-  renderAlerts(summary?.alerts||[]);
-
   const detailReady=Boolean(state.detail&&state.detail.symbol===state.selectedSymbol&&state.detail.timeframe===state.selectedTimeframe);
   const activeDetail=detailReady?state.detail:null;
+
+  renderChartTitle(summary);
+  renderMetrics(summary,priceMove);
+  renderFinalSignal(activeDetail?.decision);
+  renderAlerts(summary?.alerts||[]);
   renderOrderBook(activeDetail?.orderBook,summary);
   renderVolumeProfile(activeDetail?.volumeProfile,summary);
   renderChart(activeDetail,summary);
-
-  const bSym=state.binanceSymbols[state.selectedSymbol]||'-';
-  binanceMapEl.textContent=`Binance: ${state.selectedSymbol} -> ${bSym} - TF ${state.selectedTimeframe}`;
 }
 
 function connect(){
@@ -717,7 +891,6 @@ function connect(){
       state.symbols=msg.symbols||[];
       state.timeframes=msg.timeframes||[];
       state.defaults=msg.defaults||state.defaults;
-      state.binanceSymbols=msg.binanceSymbols||{};
 
       if(!state.symbols.includes(state.selectedSymbol)){
         state.selectedSymbol=state.defaults.symbol||state.symbols[0]||'BTCUSD';

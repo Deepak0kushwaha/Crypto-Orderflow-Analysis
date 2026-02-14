@@ -20,11 +20,9 @@
       <section class="topbar">
         <div>
           <h1>Orderflow Radar</h1>
-          <p>Custom interactive orderflow chart with Binance live tape</p>
         </div>
         <div class="status-wrap">
           <span id="connectionStatus" class="chip chip-warning">Connecting</span>
-          <span id="binanceMap" class="chip">Binance: -</span>
         </div>
       </section>
 
@@ -46,10 +44,24 @@
         <article class="metric-card"><h2>Nearest Resistance</h2><p id="metricResistance">-</p></article>
       </section>
 
+      <section class="panel alerts-panel">
+        <div class="panel-head"><h3>Live Signals</h3></div>
+        <div id="finalSignalCard" class="final-signal-card wait">
+          <div class="final-signal-head">
+            <span class="final-signal-label">Final Signal</span>
+            <span id="finalSignalSide" class="final-signal-side">WAIT</span>
+            <span id="finalSignalConfidence" class="final-signal-confidence">0%</span>
+          </div>
+          <p id="finalSignalMeta" class="final-signal-meta">Waiting for enough aligned orderflow evidence.</p>
+        </div>
+        <div id="alertsList" class="alerts-list"></div>
+      </section>
+
       <section class="panel chart-panel">
         <div class="panel-head">
-          <h3>TradingView-Style Chart: Price + CVD + Signals + Zones</h3>
+          <h3 id="chartTitle">BTCUSD Orderflow Chart</h3>
           <div class="legend">
+            <span id="chartTimeZone" class="legend-item">Time Zone: IST (Asia/Kolkata)</span>
             <span class="legend-item bull">Green heat = Buy pressure</span>
             <span class="legend-item bear">Red heat = Sell pressure</span>
           </div>
@@ -98,11 +110,6 @@
           </div>
           <div id="volumeProfileRows" class="vp-rows"></div>
         </section>
-      </section>
-
-      <section class="panel alerts-panel">
-        <div class="panel-head"><h3>Live Signals</h3></div>
-        <div id="alertsList" class="alerts-list"></div>
       </section>
     </main>
   </body>
