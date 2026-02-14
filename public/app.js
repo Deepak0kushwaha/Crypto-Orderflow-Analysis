@@ -60,6 +60,7 @@ const vpTotalVolumeEl=document.getElementById('vpTotalVolume');
 const volumeProfileRowsEl=document.getElementById('volumeProfileRows');
 const chartTitleEl=document.getElementById('chartTitle');
 const chartTimeZoneEl=document.getElementById('chartTimeZone');
+const visitCounterEl=document.getElementById('visitCounter');
 
 const IST_TIMEZONE='Asia/Kolkata';
 const IST_TIME_FORMATTER=new Intl.DateTimeFormat('en-IN',{
@@ -403,6 +404,32 @@ function renderChartTitle(summary){
   }
   if(chartTimeZoneEl){
     chartTimeZoneEl.textContent=`Time Zone: IST (Asia/Kolkata) ${IST_TIME_FORMATTER.format(new Date())}`;
+  }
+}
+
+function renderVisitCounter(visits){
+  if(!visitCounterEl){return;}
+  if(!Number.isFinite(visits)||visits<0){
+    visitCounterEl.textContent='Visits: -';
+    return;
+  }
+  visitCounterEl.textContent=`Visits: ${Math.round(visits).toLocaleString('en-IN')}`;
+}
+
+async function recordVisit(){
+  if(!visitCounterEl){return;}
+  visitCounterEl.textContent='Visits: ...';
+  try{
+    const response=await fetch('/api/visit',{
+      method:'POST',
+      headers:{'cache-control':'no-store'},
+      cache:'no-store',
+    });
+    if(!response.ok){throw new Error(`Visit API failed: ${response.status}`);}
+    const payload=await response.json();
+    renderVisitCounter(Number(payload?.visits));
+  }catch{
+    visitCounterEl.textContent='Visits: -';
   }
 }
 
@@ -917,4 +944,5 @@ function connect(){
 }
 
 initChart();
+recordVisit();
 connect();

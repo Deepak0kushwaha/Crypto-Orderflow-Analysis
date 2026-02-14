@@ -1339,6 +1339,19 @@ function normalizeSubscription(msg){
 
 const app=express();
 app.use(express.static(path.join(__dirname,'public')));
+let visitCounter=0;
+
+app.post('/api/visit',(_req,res)=>{
+  visitCounter+=1;
+  res.set('Cache-Control','no-store');
+  res.json({ok:true,visits:visitCounter,ts:Date.now()});
+});
+
+app.get('/api/visit',(_req,res)=>{
+  res.set('Cache-Control','no-store');
+  res.json({ok:true,visits:visitCounter,ts:Date.now()});
+});
+
 app.get('/health',(_req,res)=>{
   const now=Date.now();
   const ageMs=(ts)=>ts?Math.max(0,now-ts):null;
@@ -1356,6 +1369,7 @@ app.get('/health',(_req,res)=>{
   res.json({
     ok:true,
     ts:now,
+    visits:visitCounter,
     binanceSource:getActiveBinanceSource().name,
     commit:process.env.RENDER_GIT_COMMIT||process.env.RENDER_GIT_COMMIT_SHA||null,
     symbols,
