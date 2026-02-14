@@ -53,6 +53,8 @@ Open `http://localhost:3000`.
 `GitHub Pages` is static hosting and will not run this live websocket backend.  
 Use `Render` (or Railway/Fly) for a public URL.
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Deepak0kushwaha/Crypto-Orderflow-Analysis)
+
 1. Push this project to a GitHub repository.
 2. In Render, create a new `Web Service` from that repo.
 3. Render will auto-detect `render.yaml` in this repo.
