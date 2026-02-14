@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Crypto Orderflow Radar</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient"></div>
+    <main class="layout">
+      <section class="topbar">
+        <div>
+          <h1>Orderflow Radar</h1>
+          <p>Custom interactive orderflow chart with Binance live tape</p>
+        </div>
+        <div class="status-wrap">
+          <span id="connectionStatus" class="chip chip-warning">Connecting</span>
+          <span id="binanceMap" class="chip">Binance: -</span>
+        </div>
+      </section>
+
+      <section id="symbolTabs" class="symbol-tabs"></section>
+      <section id="timeframeTabs" class="timeframe-tabs"></section>
+
+      <section class="metrics-grid">
+        <article class="metric-card">
+          <h2>Last Price</h2>
+          <p id="metricPrice">-</p>
+          <p id="metricPriceMove" class="metric-sub neutral">-</p>
+        </article>
+        <article class="metric-card"><h2>CVD</h2><p id="metricCvd">-</p></article>
+        <article class="metric-card"><h2>Delta (15s)</h2><p id="metricDelta">-</p></article>
+        <article class="metric-card"><h2>Spread %</h2><p id="metricSpread">-</p></article>
+        <article class="metric-card"><h2>Top5 Bid Liquidity</h2><p id="metricBidLiq">-</p></article>
+        <article class="metric-card"><h2>Top5 Ask Liquidity</h2><p id="metricAskLiq">-</p></article>
+        <article class="metric-card"><h2>Nearest Support</h2><p id="metricSupport">-</p></article>
+        <article class="metric-card"><h2>Nearest Resistance</h2><p id="metricResistance">-</p></article>
+      </section>
+
+      <section class="panel chart-panel">
+        <div class="panel-head">
+          <h3>TradingView-Style Chart: Price + CVD + Signals + Zones</h3>
+          <div class="legend">
+            <span class="legend-item bull">Green heat = Buy pressure</span>
+            <span class="legend-item bear">Red heat = Sell pressure</span>
+          </div>
+        </div>
+        <div class="canvas-wrap">
+          <div id="orderflowChart"></div>
+          <canvas id="footprintOverlay"></canvas>
+        </div>
+        <p class="chart-help">Scroll: zoom, Drag: pan, Double-click: fit content, right axis/time axis are interactive</p>
+      </section>
+
+      <section class="market-structure-grid">
+        <section class="panel orderbook-panel">
+          <div class="panel-head">
+            <h3>Order Book</h3>
+            <div class="legend">
+              <span id="orderBookSpread" class="legend-item">Spread -</span>
+              <span id="orderBookImbalance" class="legend-item">Imbalance -</span>
+              <span id="orderBookSpeed" class="legend-item">Speed -</span>
+            </div>
+          </div>
+          <div class="book-columns">
+            <div class="book-side">
+              <div class="book-head ask"><span>Asks</span><span>Qty</span><span>Cum</span></div>
+              <div id="orderBookAsks" class="book-rows"></div>
+            </div>
+            <div class="book-side">
+              <div class="book-head bid"><span>Bids</span><span>Qty</span><span>Cum</span></div>
+              <div id="orderBookBids" class="book-rows"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel profile-panel">
+          <div class="panel-head">
+            <h3>Volume Profile</h3>
+            <div class="legend">
+              <span id="vpPoc" class="legend-item">POC -</span>
+              <span id="vpValueArea" class="legend-item">VA -</span>
+              <span id="vpDelta" class="legend-item">Profile Delta -</span>
+            </div>
+          </div>
+          <div class="vp-headline">
+            <span id="vpBinSize">Bin -</span>
+            <span id="vpTotalVolume">Total -</span>
+          </div>
+          <div id="volumeProfileRows" class="vp-rows"></div>
+        </section>
+      </section>
+
+      <section class="panel alerts-panel">
+        <div class="panel-head"><h3>Live Signals</h3></div>
+        <div id="alertsList" class="alerts-list"></div>
+      </section>
+    </main>
+  </body>
+</html>

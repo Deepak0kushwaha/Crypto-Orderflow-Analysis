@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: crypto-orderflow-webapp
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22
