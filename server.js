@@ -18,7 +18,7 @@ const DEFAULT_TIMEFRAME='1m';
 const STREAM_TO_SYMBOL=Object.fromEntries(Object.entries(MARKETS).map(([s,c])=>[c.stream,s]));
 const BINANCE_SOURCES=[
   {name:'global',restBase:'https://api.binance.com',wsBase:'wss://stream.binance.com'},
-  {name:'us',restBase:'https://api.binance.us',wsBase:'wss://stream.binance.us'},
+  {name:'us',restBase:'https://api.binance.us',wsBase:'wss://stream.binance.us:9443'},
 ];
 const BINANCE_SOURCE_PREF=(process.env.BINANCE_SOURCE||'auto').toLowerCase();
 let activeBinanceSourceIndex=BINANCE_SOURCE_PREF==='us'?1:0;
@@ -35,6 +35,9 @@ const ORDER_BOOK_DETAIL_LEVELS=20;
 const VOLUME_PROFILE_TARGET_BINS=42;
 const VALUE_AREA_TARGET_PCT=0.7;
 const SNAPSHOT_INTERVAL_MS=300;
+const REST_FALLBACK_INTERVAL_MS=1200;
+const REST_STALE_THRESHOLD_MS=2400;
+const REST_RECENT_TRADES_LIMIT=30;
 
 function getActiveBinanceSource(){
   return BINANCE_SOURCES[activeBinanceSourceIndex]||BINANCE_SOURCES[0];
@@ -56,6 +59,7 @@ function symbolState(symbol,cfg){
     currentMinute:null,currentMinuteVolume:0,minuteSeries:[],tradeWindow:[],priceWindow:[],alerts:[],frames,
     lastAlertAt:{divergence:0,absorption:0,sweep:0},deltaEma:0,pendingDrops:{ask:null,bid:null},replenishments:[],sweepCandidates:[],
     orderBook:{ts:0,bids:[],asks:[],bidTotal:0,askTotal:0,imbalance:0,speed:0},lastDepthUpdateTs:0,depthRateEma:0,
+    lastTradeUpdateTs:0,lastAnyMarketDataTs:0,lastRestTradeId:0,
   };
 }
 const state=Object.fromEntries(Object.entries(MARKETS).map(([s,c])=>[s,symbolState(s,c)]));
@@ -176,6 +180,8 @@ function handleTrade(data,s){
   const ts=Number(data.T||data.E||Date.now());
   const price=Number(data.p);const qty=Number(data.q);const isBuyerMaker=Boolean(data.m);
   if(!Number.isFinite(price)||!Number.isFinite(qty)||qty<=0){return;}
+  s.lastTradeUpdateTs=ts;
+  s.lastAnyMarketDataTs=ts;
   s.lastPrice=price;
   const deltaQty=isBuyerMaker?-qty:qty;
   s.cvd+=deltaQty;
@@ -199,6 +205,7 @@ function handleDepth(data,s){
     .filter((x)=>Number.isFinite(x.price)&&Number.isFinite(x.qty)&&x.qty>0)
     .sort((a,b)=>a.price-b.price);
   if(!bids.length||!asks.length){return;}
+  s.lastAnyMarketDataTs=now;
   const topBid=bids[0].price;const topAsk=asks[0].price;
   s.lastTopBid=topBid;s.lastTopAsk=topAsk;s.spreadPct=topBid>0?(topAsk-topBid)/topBid:0;
   if(s.lastPrice===null&&Number.isFinite(topBid)&&Number.isFinite(topAsk)){s.lastPrice=(topBid+topAsk)/2;}
@@ -684,7 +691,27 @@ function normalizeSubscription(msg){
 
 const app=express();
 app.use(express.static(path.join(__dirname,'public')));
-app.get('/health',(_req,res)=>{res.json({ok:true,ts:Date.now()});});
+app.get('/health',(_req,res)=>{
+  const now=Date.now();
+  const symbols=Object.fromEntries(
+    Object.values(state).map((s)=>[
+      s.symbol,
+      {
+        price:s.lastPrice,
+        orderBookLevels:(s.orderBook?.bids?.length||0)+(s.orderBook?.asks?.length||0),
+        tradeAgeMs:s.lastTradeUpdateTs?now-s.lastTradeUpdateTs:null,
+        depthAgeMs:s.lastDepthUpdateTs?now-s.lastDepthUpdateTs:null,
+      },
+    ]),
+  );
+  res.json({
+    ok:true,
+    ts:now,
+    binanceSource:getActiveBinanceSource().name,
+    commit:process.env.RENDER_GIT_COMMIT||process.env.RENDER_GIT_COMMIT_SHA||null,
+    symbols,
+  });
+});
 
 const server=http.createServer(app);
 const wss=new WebSocket.Server({server});
@@ -758,35 +785,44 @@ function insertBar(frame, barTs, bar) {
   }
 }
 
-async function fetchKlines(binanceSymbol, interval, limit = 260) {
+async function fetchJsonWithFallback(pathname) {
   const sourceOrder=[activeBinanceSourceIndex,...BINANCE_SOURCES.map((_x,i)=>i).filter((i)=>i!==activeBinanceSourceIndex)];
-  let lastErr=new Error(`klines ${binanceSymbol} ${interval} failed`);
+  let lastErr=new Error(`request failed: ${pathname}`);
 
   for(const idx of sourceOrder){
     const src=BINANCE_SOURCES[idx];
-    const url = `${src.restBase}/api/v3/klines?symbol=${binanceSymbol}&interval=${interval}&limit=${limit}`;
+    const url = `${src.restBase}${pathname}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(()=>controller.abort(),5000);
     try{
-      const res = await fetch(url);
+      const res = await fetch(url,{signal:controller.signal});
       if (!res.ok) {
         throw new Error(`http ${res.status}`);
       }
-      const rows=await res.json();
-      if(!Array.isArray(rows)||rows.length===0){
-        throw new Error('empty response');
-      }
+      const body=await res.json();
       if(idx!==activeBinanceSourceIndex){
         const prev=getActiveBinanceSource();
         activeBinanceSourceIndex=idx;
         const next=getActiveBinanceSource();
         console.log(`[binance] REST source switched ${prev.name} -> ${next.name}`);
       }
-      return rows;
+      return body;
     }catch(err){
       lastErr=new Error(`source ${src.name}: ${err.message}`);
+    }finally{
+      clearTimeout(timeout);
     }
   }
 
   throw lastErr;
+}
+
+async function fetchKlines(binanceSymbol, interval, limit = 260) {
+  const rows=await fetchJsonWithFallback(`/api/v3/klines?symbol=${binanceSymbol}&interval=${interval}&limit=${limit}`);
+  if(!Array.isArray(rows)||rows.length===0){
+    throw new Error(`klines ${binanceSymbol} ${interval} empty response`);
+  }
+  return rows;
 }
 
 function seedFrameFromKlines(s, timeframeKey, rows) {
@@ -896,6 +932,76 @@ async function seedHistoricalData() {
   }
 }
 
+let restFallbackTimer=null;
+let restFallbackInFlight=false;
+
+function staleForRestFallback(s, now){
+  const tradeAge=s.lastTradeUpdateTs>0?now-s.lastTradeUpdateTs:Infinity;
+  const depthAge=s.lastDepthUpdateTs>0?now-s.lastDepthUpdateTs:Infinity;
+  return{trade:tradeAge>REST_STALE_THRESHOLD_MS,depth:depthAge>REST_STALE_THRESHOLD_MS};
+}
+
+async function backfillTradesFromRest(s,cfg){
+  const symbol=cfg.stream.toUpperCase();
+  const rows=await fetchJsonWithFallback(`/api/v3/trades?symbol=${symbol}&limit=${REST_RECENT_TRADES_LIMIT}`);
+  if(!Array.isArray(rows)||rows.length===0){return;}
+  const sorted=rows
+    .map((t)=>({
+      id:Number(t.id),
+      price:Number(t.price),
+      qty:Number(t.qty),
+      ts:Number(t.time),
+      isBuyerMaker:Boolean(t.isBuyerMaker),
+    }))
+    .filter((t)=>Number.isFinite(t.id)&&Number.isFinite(t.price)&&Number.isFinite(t.qty)&&t.qty>0&&Number.isFinite(t.ts))
+    .sort((a,b)=>a.id-b.id);
+  if(!sorted.length){return;}
+
+  if(s.lastRestTradeId===0){
+    s.lastRestTradeId=sorted[0].id-1;
+  }
+
+  const fresh=sorted.filter((t)=>t.id>s.lastRestTradeId);
+  for(const trade of fresh){
+    handleTrade({T:trade.ts,p:trade.price,q:trade.qty,m:trade.isBuyerMaker},s);
+  }
+  s.lastRestTradeId=Math.max(s.lastRestTradeId,sorted[sorted.length-1].id);
+}
+
+async function backfillDepthFromRest(s,cfg){
+  const symbol=cfg.stream.toUpperCase();
+  const depth=await fetchJsonWithFallback(`/api/v3/depth?symbol=${symbol}&limit=${ORDER_BOOK_LEVELS}`);
+  if(!depth||!Array.isArray(depth.bids)||!Array.isArray(depth.asks)){return;}
+  handleDepth({E:Date.now(),bids:depth.bids,asks:depth.asks},s);
+}
+
+async function pollRestFallback(){
+  if(restFallbackInFlight){return;}
+  restFallbackInFlight=true;
+  const now=Date.now();
+  try{
+    for(const [symbol,cfg] of Object.entries(MARKETS)){
+      const s=state[symbol];
+      const stale=staleForRestFallback(s,now);
+      if(stale.trade){
+        try{await backfillTradesFromRest(s,cfg);}catch(err){console.error(`[fallback] ${symbol} trades: ${err.message}`);}
+      }
+      if(stale.depth){
+        try{await backfillDepthFromRest(s,cfg);}catch(err){console.error(`[fallback] ${symbol} depth: ${err.message}`);}
+      }
+    }
+  }finally{
+    restFallbackInFlight=false;
+  }
+}
+
+function startRestFallbackPoller(){
+  if(restFallbackTimer){return;}
+  restFallbackTimer=setInterval(()=>{
+    pollRestFallback().catch((err)=>console.error('[fallback] poll error',err.message));
+  },REST_FALLBACK_INTERVAL_MS);
+}
+
 function connectBinance(){
   const streamUrl=buildBinanceStreamUrl();
   binanceSocket=new WebSocket(streamUrl);
@@ -953,5 +1059,6 @@ seedHistoricalData()
     console.error('[seed] failed:', err.message);
   })
   .finally(() => {
+    startRestFallbackPoller();
     connectBinance();
   });
