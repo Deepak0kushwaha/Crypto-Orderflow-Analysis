@@ -44,6 +44,7 @@ const FLOW_WINDOW_BASELINE_MS=60000;
 const STACKED_IMBALANCE_RATIO=2.2;
 const STACKED_IMBALANCE_LEVELS=3;
 const SPOOFING_QTR_THRESHOLD=6.5;
+const QUOTE_CANDLE_FALLBACK_AFTER_MS=1500;
 
 function getActiveBinanceSource(){
   return BINANCE_SOURCES[activeBinanceSourceIndex]||BINANCE_SOURCES[0];
@@ -118,6 +119,23 @@ function updateBarsAndFootprint(s,ts,price,qty,isBuyerMaker){
     const level=roundToTick(price,s.cfg.tickSize);const k=String(level);
     if(!b.levels.has(k)){b.levels.set(k,{buy:0,sell:0,delta:0,total:0});}
     const cell=b.levels.get(k);cell.buy+=buy;cell.sell+=sell;cell.delta+=buy-sell;cell.total+=qty;
+  }
+}
+
+function updateBarsFromQuote(s,ts,price){
+  if(!Number.isFinite(price)){return;}
+  s.lastPrice=price;
+  s.priceWindow.push({ts,price});
+  pruneByAge(s.priceWindow,ts,70000);
+  updateMinuteSeries(s,ts,0);
+
+  for(const tf of TIMEFRAMES){
+    const barTs=Math.floor(ts/tf.ms)*tf.ms;
+    const b=ensureFrameBar(s,tf.key,barTs,price);
+    b.high=Math.max(b.high,price);
+    b.low=Math.min(b.low,price);
+    b.close=price;
+    b.cvdClose=s.cvd;
   }
 }
 function detectCvdDivergence(s){
@@ -325,8 +343,13 @@ function handleDepth(data,s){
   }
   s.bestQuote={bidPrice:topBid,bidQty:topBidQty1,askPrice:topAsk,askQty:topAskQty1};
 
+  const midPrice=Number.isFinite(topBid)&&Number.isFinite(topAsk)?(topBid+topAsk)/2:null;
   s.lastTopBid=topBid;s.lastTopAsk=topAsk;s.spreadPct=topBid>0?(topAsk-topBid)/topBid:0;
-  if(s.lastPrice===null&&Number.isFinite(topBid)&&Number.isFinite(topAsk)){s.lastPrice=(topBid+topAsk)/2;}
+  if(s.lastPrice===null&&Number.isFinite(midPrice)){s.lastPrice=midPrice;}
+  const tradeAgeMs=s.lastTradeUpdateTs>0?now-s.lastTradeUpdateTs:Infinity;
+  if(Number.isFinite(midPrice)&&tradeAgeMs>QUOTE_CANDLE_FALLBACK_AFTER_MS){
+    updateBarsFromQuote(s,now,midPrice);
+  }
   const topBidQty5=bids.slice(0,5).reduce((sum,l)=>sum+l.qty,0);
   const topAskQty5=asks.slice(0,5).reduce((sum,l)=>sum+l.qty,0);
 
