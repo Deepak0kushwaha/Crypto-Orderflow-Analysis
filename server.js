@@ -59,7 +59,7 @@ function symbolState(symbol,cfg){
     currentMinute:null,currentMinuteVolume:0,minuteSeries:[],tradeWindow:[],priceWindow:[],alerts:[],frames,
     lastAlertAt:{divergence:0,absorption:0,sweep:0},deltaEma:0,pendingDrops:{ask:null,bid:null},replenishments:[],sweepCandidates:[],
     orderBook:{ts:0,bids:[],asks:[],bidTotal:0,askTotal:0,imbalance:0,speed:0},lastDepthUpdateTs:0,depthRateEma:0,
-    lastTradeUpdateTs:0,lastAnyMarketDataTs:0,lastRestTradeId:0,
+    lastTradeUpdateTs:0,lastAnyMarketDataTs:0,lastRestTradeIds:Object.fromEntries(BINANCE_SOURCES.map((src)=>[src.name,0])),
   };
 }
 const state=Object.fromEntries(Object.entries(MARKETS).map(([s,c])=>[s,symbolState(s,c)]));
@@ -693,14 +693,15 @@ const app=express();
 app.use(express.static(path.join(__dirname,'public')));
 app.get('/health',(_req,res)=>{
   const now=Date.now();
+  const ageMs=(ts)=>ts?Math.max(0,now-ts):null;
   const symbols=Object.fromEntries(
     Object.values(state).map((s)=>[
       s.symbol,
       {
         price:s.lastPrice,
         orderBookLevels:(s.orderBook?.bids?.length||0)+(s.orderBook?.asks?.length||0),
-        tradeAgeMs:s.lastTradeUpdateTs?now-s.lastTradeUpdateTs:null,
-        depthAgeMs:s.lastDepthUpdateTs?now-s.lastDepthUpdateTs:null,
+        tradeAgeMs:ageMs(s.lastTradeUpdateTs),
+        depthAgeMs:ageMs(s.lastDepthUpdateTs),
       },
     ]),
   );
@@ -791,15 +792,8 @@ async function fetchJsonWithFallback(pathname) {
 
   for(const idx of sourceOrder){
     const src=BINANCE_SOURCES[idx];
-    const url = `${src.restBase}${pathname}`;
-    const controller = new AbortController();
-    const timeout = setTimeout(()=>controller.abort(),5000);
     try{
-      const res = await fetch(url,{signal:controller.signal});
-      if (!res.ok) {
-        throw new Error(`http ${res.status}`);
-      }
-      const body=await res.json();
+      const body=await fetchJsonFromSource(src,pathname);
       if(idx!==activeBinanceSourceIndex){
         const prev=getActiveBinanceSource();
         activeBinanceSourceIndex=idx;
@@ -809,12 +803,25 @@ async function fetchJsonWithFallback(pathname) {
       return body;
     }catch(err){
       lastErr=new Error(`source ${src.name}: ${err.message}`);
-    }finally{
-      clearTimeout(timeout);
     }
   }
 
   throw lastErr;
+}
+
+async function fetchJsonFromSource(src, pathname) {
+  const url = `${src.restBase}${pathname}`;
+  const controller = new AbortController();
+  const timeout = setTimeout(()=>controller.abort(),5000);
+  try{
+    const res = await fetch(url,{signal:controller.signal});
+    if (!res.ok) {
+      throw new Error(`http ${res.status}`);
+    }
+    return await res.json();
+  }finally{
+    clearTimeout(timeout);
+  }
 }
 
 async function fetchKlines(binanceSymbol, interval, limit = 260) {
@@ -823,6 +830,28 @@ async function fetchKlines(binanceSymbol, interval, limit = 260) {
     throw new Error(`klines ${binanceSymbol} ${interval} empty response`);
   }
   return rows;
+}
+
+async function fetchAggTradesPreferGlobal(binanceSymbol, limit = REST_RECENT_TRADES_LIMIT) {
+  const preferredOrder=[
+    ...BINANCE_SOURCES.map((_x,i)=>i).filter((i)=>BINANCE_SOURCES[i].name==='global'),
+    ...BINANCE_SOURCES.map((_x,i)=>i).filter((i)=>BINANCE_SOURCES[i].name!=='global'),
+  ];
+  let lastErr=new Error(`aggTrades ${binanceSymbol} failed`);
+
+  for(const idx of preferredOrder){
+    const src=BINANCE_SOURCES[idx];
+    try{
+      const rows=await fetchJsonFromSource(src,`/api/v3/aggTrades?symbol=${binanceSymbol}&limit=${limit}`);
+      if(!Array.isArray(rows)||rows.length===0){
+        throw new Error('empty response');
+      }
+      return{rows,sourceIndex:idx};
+    }catch(err){
+      lastErr=new Error(`source ${src.name}: ${err.message}`);
+    }
+  }
+  throw lastErr;
 }
 
 function seedFrameFromKlines(s, timeframeKey, rows) {
@@ -943,29 +972,34 @@ function staleForRestFallback(s, now){
 
 async function backfillTradesFromRest(s,cfg){
   const symbol=cfg.stream.toUpperCase();
-  const rows=await fetchJsonWithFallback(`/api/v3/trades?symbol=${symbol}&limit=${REST_RECENT_TRADES_LIMIT}`);
+  const {rows,sourceIndex}=await fetchAggTradesPreferGlobal(symbol,REST_RECENT_TRADES_LIMIT);
+  const sourceName=BINANCE_SOURCES[sourceIndex]?.name||'global';
   if(!Array.isArray(rows)||rows.length===0){return;}
   const sorted=rows
     .map((t)=>({
-      id:Number(t.id),
-      price:Number(t.price),
-      qty:Number(t.qty),
-      ts:Number(t.time),
-      isBuyerMaker:Boolean(t.isBuyerMaker),
+      id:Number(t.a),
+      price:Number(t.p),
+      qty:Number(t.q),
+      ts:Number(t.T),
+      isBuyerMaker:Boolean(t.m),
     }))
     .filter((t)=>Number.isFinite(t.id)&&Number.isFinite(t.price)&&Number.isFinite(t.qty)&&t.qty>0&&Number.isFinite(t.ts))
     .sort((a,b)=>a.id-b.id);
   if(!sorted.length){return;}
 
-  if(s.lastRestTradeId===0){
-    s.lastRestTradeId=sorted[0].id-1;
+  if(!s.lastRestTradeIds[sourceName]){
+    s.lastRestTradeIds[sourceName]=sorted[0].id-1;
   }
 
-  const fresh=sorted.filter((t)=>t.id>s.lastRestTradeId);
+  const lastId=s.lastRestTradeIds[sourceName]||0;
+  let fresh=sorted.filter((t)=>t.id>lastId);
+  if(!fresh.length&&s.lastTradeUpdateTs>0){
+    fresh=sorted.filter((t)=>t.ts>s.lastTradeUpdateTs+1);
+  }
   for(const trade of fresh){
     handleTrade({T:trade.ts,p:trade.price,q:trade.qty,m:trade.isBuyerMaker},s);
   }
-  s.lastRestTradeId=Math.max(s.lastRestTradeId,sorted[sorted.length-1].id);
+  s.lastRestTradeIds[sourceName]=Math.max(lastId,sorted[sorted.length-1].id);
 }
 
 async function backfillDepthFromRest(s,cfg){
