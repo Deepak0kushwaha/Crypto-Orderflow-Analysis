@@ -4,6 +4,12 @@ Live orderflow analysis webapp for `BTCUSD`, `ETHUSD`, `SOLUSD`, and `XRPUSD`.
 
 This project helps traders read real-time liquidity behavior and convert that context into structured `BUY` / `SELL` / `WAIT` decisions.
 
+## Live Webapp Link
+
+Anyone can open the webapp directly from this public URL:
+
+- [https://crypto-orderflow-webapp.onrender.com/](https://crypto-orderflow-webapp.onrender.com/)
+
 ## What This Project Does
 
 - Streams live market data and renders:
@@ -85,10 +91,17 @@ Open: `http://localhost:3000`
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Deepak0kushwaha/Crypto-Orderflow-Analysis)
 
-1. Push code to GitHub.
-2. Create a Render Web Service from repo.
-3. Render uses `render.yaml`.
-4. Share your live URL.
+Current live deployment:
+
+- [https://crypto-orderflow-webapp.onrender.com/](https://crypto-orderflow-webapp.onrender.com/)
+
+Steps to deploy/update:
+
+1. Push code to GitHub `main` branch.
+2. Create a Render Web Service from the GitHub repo (first time only).
+3. Render uses `render.yaml` for build/start settings.
+4. Keep `autoDeploy: true` so every new push updates the webapp.
+5. Share the live URL so anyone can open it in a browser.
 
 ## Useful Endpoints
 
