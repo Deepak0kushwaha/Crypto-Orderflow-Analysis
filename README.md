@@ -58,7 +58,7 @@ Use `Render` (or Railway/Fly) for a public URL.
 1. Push this project to a GitHub repository.
 2. In Render, create a new `Web Service` from that repo.
 3. Render will auto-detect `render.yaml` in this repo.
-4. After first deploy, share the Render URL (`https://...onrender.com`).
+4. After first deploy, share the Render URL (`https://crypto-orderflow-webapp.onrender.com`).
 
 ### Minimal push commands
 
